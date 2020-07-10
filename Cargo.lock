@@ -3,3 +3,32 @@
 [[package]]
 name = "orc-format"
 version = "0.1.0"
+dependencies = [
+ "protobuf",
+ "protobuf-codegen-pure",
+]
+
+[[package]]
+name = "protobuf"
+version = "2.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d883f78645c21b7281d21305181aa1f4dd9e9363e7cf2566c93121552cff003e"
+
+[[package]]
+name = "protobuf-codegen"
+version = "2.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c3f99b1babb22152c6591b076d46f64e313c6e30f6f334a89e260e1b3569e6"
+dependencies = [
+ "protobuf",
+]
+
+[[package]]
+name = "protobuf-codegen-pure"
+version = "2.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cd0751bffc065c0ebb04871866924a0028c5707249da39bc058a73bd348b55f"
+dependencies = [
+ "protobuf",
+ "protobuf-codegen",
+]
