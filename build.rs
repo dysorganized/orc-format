@@ -1,10 +1,5 @@
-extern crate protobuf_codegen_pure;
-
+extern crate prost_build;
 fn main() {
-    protobuf_codegen_pure::Codegen::new()
-        .out_dir("src/protos")
-        .inputs(&["protos/a.proto", "protos/b.proto"])
-        .include("protos")
-        .run()
-        .expect("Codegen failed.");
+    prost_build::compile_protos(&["src/orc.proto"],
+                                &["src/"]).unwrap();
 }
