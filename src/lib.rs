@@ -56,7 +56,12 @@ impl<F: Read+Seek> ORCFile<F> {
                 decoder.read_to_end(&mut decomp_buffer)?;
                 &decomp_buffer[..]
             }
-            _ => todo!("Only Zlib compression is supported yet.")
+            (_, messages::CompressionKind::Snappy) => {
+                let mut decoder = snap::read::FrameDecoder::new(&comp_buffer[3..chunk_len+3]);
+                decoder.read_to_end(&mut decomp_buffer)?;
+                &decomp_buffer[..]
+            }
+            _ => todo!("Only Zlib and Snappy compression is supported yet.")
             // Snappy = 2,
             // Lzo = 3,
             // Lz4 = 4,
