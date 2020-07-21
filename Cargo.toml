@@ -9,6 +9,7 @@ edition = "2018"
 [dependencies]
 prost = "0.6"
 thiserror = "1.0"
+flate2 = "1.0.14"
 
 [build-dependencies]
 prost-build = "0.6"
