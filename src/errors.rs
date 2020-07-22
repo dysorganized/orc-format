@@ -6,6 +6,8 @@ pub enum OrcError {
     ProtobufError(#[from] prost::DecodeError),
     #[error("Truncated or empty message. Is the file empty or incomplete?")]
     TruncatedError,
+    #[error("Invalid schema: {0}")]
+    SchemaError(&'static str),
     #[error("IO Error")]
     IOError(#[from] std::io::Error)
 }
