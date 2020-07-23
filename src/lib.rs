@@ -1,15 +1,16 @@
 #[macro_use] extern crate maplit;
 #[macro_use] extern crate hex_literal;
 mod errors;
-pub use crate::errors::{OrcError, OrcResult};
 use prost::Message;
+pub use crate::errors::{OrcError, OrcResult};
 use std::io::{Read, Seek, SeekFrom, Cursor};
 use std::collections::HashMap;
 
-// Include the `messages` module, which is generated from orc.proto.
+/// Include the `messages` module, which is generated from orc.proto.
 pub mod messages {
     include!(concat!(env!("OUT_DIR"), "/orc.proto.rs"));
 }
+
 /// A handle on an open ORC file
 ///
 /// This object holds a reference to the remainder of the file,
@@ -202,21 +203,11 @@ impl<F: Read+Seek> ORCFile<F> {
     /// with a new OrcFile for each one,
     /// or open an `std::io::Cursor` on an mmap of the file and clone the OrcFile at will.
     /// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
-    pub fn stripe<'t> (&'t mut self, stripe_id: usize) -> Option<Stripe<'t, F>> {
+    pub fn stripe<'t> (&'t mut self, stripe_id: usize) -> OrcResult<Stripe<'t, F>> {
         if stripe_id < self.footer.stripes.len() {
-            Some(Stripe {
-                offset: self.footer.stripes[stripe_id].offset(),
-                index_length: self.footer.stripes[stripe_id].index_length(),
-                data_length: self.footer.stripes[stripe_id].data_length(),
-                footer_length: self.footer.stripes[stripe_id].footer_length(),
-                number_of_rows: self.footer.stripes[stripe_id].number_of_rows(),
-                // Two more fields for encryption are not supported yet
-                stripe_id,
-                // Make this borrow the last thing to happen here
-                file: self,
-            })
+            Stripe::new(stripe_id,self)
         } else {
-            None
+            Err(OrcError::NoSuchStripe(stripe_id))
         }
     }
 }
@@ -289,17 +280,74 @@ pub enum Type {
 /// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
 pub struct Stripe<'t, F:Read+Seek> {
     file: &'t mut ORCFile<F>,
-    stripe_id: usize,
-    offset: u64,
-    index_length: u64,
-    data_length: u64,
-    footer_length: u64,
-    number_of_rows: u64
+    id: usize,
+    info: messages::StripeInformation,
+    footer: messages:: StripeFooter
 }
 impl<'t, F:Read+Seek> Stripe<'t, F> {
-    /// How many rows are in this stripe
+    /// Create a stripe from StripeInformation and a StripeFooter
+    ///
+    /// The StripeFooter is read from the parent file
+    fn new(id: usize, file: &'t mut ORCFile<F>) -> OrcResult<Self> {
+        let info = file.footer.stripes[id].clone();
+        let footer: messages::StripeFooter = file.read_message(
+            info.offset() + info.index_length() + info.data_length(), 
+            info.offset() + info.index_length() + info.data_length() + info.footer_length()
+        )?;
+        Ok(Stripe {id, info, footer, file})
+    }
+
+    /// Number of rows in this stripe
     pub fn number_of_rows(&self) -> u64 {
-        self.number_of_rows
+        self.info.number_of_rows()
+    }
+}
+/// Dynamically typed homogenous arrays, with type-specific compression
+///
+/// 
+pub enum BasicStream {
+    BooleanRLE,
+    ByteRLE,
+    IntRLE1,
+    IntRLE2,
+    UintRLE1,
+    UintRLE2,
+    Float32,
+    Float64,
+    Binary
+}
+
+impl BasicStream {
+    /// Decode a signed varint128 from a slice
+    ///
+    /// ORC uses the packed-varint128 structure protobuf2/3 uses
+    /// but it leaves out the tag prefix so it's not compatible. :/
+    /// So we use this shim to decode it instead.
+    ///
+    /// Returns the number and the remaining bytes.
+    pub fn read_i128(buf: &[u8]) -> OrcResult<(i128, &[u8])> {
+        let (value, rest) = Self::read_u128(buf)?;
+        // Inverse of (n << 1) ^ (n >> 127)
+        let zigzag = (value << 127 >> 127) ^ (value >> 1);
+        Ok((zigzag as i128, rest))
+    }
+
+    /// Decode an unsigned varint128 from a slice
+    ///
+    /// ORC uses the packed-varint128 structure protobuf2/3 uses
+    /// but it leaves out the tag prefix so it's not compatible. :/
+    /// So we use this shim to decode it instead.
+    ///
+    /// Returns the number and the remaining bytes.
+    pub fn read_u128(buf: &[u8]) -> OrcResult<(u128, &[u8])> {
+        let mut value = 0;
+        for i in 0..buf.len() {
+            value |= ((buf[i] & 0x7F) << (8*i)) as u128;
+            if buf[i] & 0x80 == 0 {
+                return Ok((value, &buf[i..]))
+            }
+        }
+        Err(OrcError::TruncatedError)
     }
 }
 
