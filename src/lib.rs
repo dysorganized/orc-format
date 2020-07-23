@@ -15,7 +15,7 @@ pub mod messages {
 /// This object holds a reference to the remainder of the file,
 /// because it has at this point only deserialized the table of contents.
 /// Reading a stripe will incur further IO and hence can fail.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ORCFile<F: Read+Seek> {
     schema: Vec<(String, Type)>,
     metadata: messages::Metadata,
@@ -193,6 +193,32 @@ impl<F: Read+Seek> ORCFile<F> {
     pub fn schema(&self) -> &[(String, Type)] {
         &self.schema
     }
+
+    /// Get information about one stripe in the file
+    ///
+    /// The stripe requires a mutable borrow because it needs to seek() the underlying reader,
+    /// and it would be a mess if they shared cursors.
+    /// If you need to use multiple stripes at a time, either open the file multiple times,
+    /// with a new OrcFile for each one,
+    /// or open an `std::io::Cursor` on an mmap of the file and clone the OrcFile at will.
+    /// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
+    pub fn stripe<'t> (&'t mut self, stripe_id: usize) -> Option<Stripe<'t, F>> {
+        if stripe_id < self.footer.stripes.len() {
+            Some(Stripe {
+                offset: self.footer.stripes[stripe_id].offset(),
+                index_length: self.footer.stripes[stripe_id].index_length(),
+                data_length: self.footer.stripes[stripe_id].data_length(),
+                footer_length: self.footer.stripes[stripe_id].footer_length(),
+                number_of_rows: self.footer.stripes[stripe_id].number_of_rows(),
+                // Two more fields for encryption are not supported yet
+                stripe_id,
+                // Make this borrow the last thing to happen here
+                file: self,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl<'t> ORCFile<Cursor<&'t [u8]>> {
@@ -225,7 +251,7 @@ pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
 /// Table Schema
 ///
 /// ORC has a relatively rich type system and supports nested types.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum Type {
     Boolean,
     Byte,
@@ -252,6 +278,29 @@ pub enum Type {
     Varchar(usize),
     Char(usize),
     TimestampInstant
+}
+/// A handle to one stripe in an ORCFile.
+///
+/// The stripe requires a mutable borrow because it needs to seek() the underlying reader,
+/// and it would be a mess if they shared cursors.
+/// If you need to use multiple stripes at a time, either open the file multiple times,
+/// with a new OrcFile for each one,
+/// or open an `std::io::Cursor` on an mmap of the file and clone the OrcFile at will.
+/// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
+pub struct Stripe<'t, F:Read+Seek> {
+    file: &'t mut ORCFile<F>,
+    stripe_id: usize,
+    offset: u64,
+    index_length: u64,
+    data_length: u64,
+    footer_length: u64,
+    number_of_rows: u64
+}
+impl<'t, F:Read+Seek> Stripe<'t, F> {
+    /// How many rows are in this stripe
+    pub fn number_of_rows(&self) -> u64 {
+        self.number_of_rows
+    }
 }
 
 
@@ -320,5 +369,13 @@ mod tests {
             ("_col22".into(), Map(Box::new(Int), Box::new(String))),
             ("_col23".into(), Map(Box::new(Map(Box::new(Int), Box::new(String))), Box::new(String)))
         ]);
+    }
+
+    #[test]
+    fn test_stripe() {
+        let orc_bytes = include_bytes!("sample.orc");
+        let mut orc_toc = super::ORCFile::from_slice(&orc_bytes[..]).unwrap();
+        let stripe = orc_toc.stripe(0).unwrap();
+        assert_eq!(stripe.number_of_rows(), 3);
     }
 }
