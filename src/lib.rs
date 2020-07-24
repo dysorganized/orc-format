@@ -68,8 +68,8 @@ pub(crate) mod codecs {
 /// Reading a stripe will incur further IO and hence can fail.
 #[derive(Debug, Clone)]
 pub struct ORCFile<F: Read+Seek> {
-    schema: Vec<(String, Type)>,
-    flat_schema: Vec<Type>,
+    schema: Vec<(String, ColumnSpec)>,
+    flat_schema: Vec<ColumnSpec>,
     metadata: messages::Metadata,
     footer: messages::Footer,
     postscript: messages::PostScript,
@@ -180,7 +180,7 @@ impl<F: Read+Seek> ORCFile<F> {
     /// Returns a tuple, containing:
     /// * the top level columns in order as a vector with names
     /// * all columns in the order they were stored (preorder by spec)
-    fn read_schema(&self, raw_types: &[messages::Type]) -> OrcResult<(Vec<(String, Type)>, Vec<Type>)> {
+    fn read_schema(&self, raw_types: &[messages::Type]) -> OrcResult<(Vec<(String, ColumnSpec)>, Vec<ColumnSpec>)> {
         // These are the types not yet claimed as children of another type.
         // At the end of the traversal, these are the roots of the type trees,
         // and are the types of each column, in order
@@ -190,33 +190,34 @@ impl<F: Read+Seek> ORCFile<F> {
         // Pop consumes the last tree off the roots stack
         // It's helpful because it gives a sensible error instead or panicing if there are no roots
         // It can't own the roots vector because then we couldn't also push to it.
-        // All the places we need it will also need to be Boxed to avoid making Type infinitely recursive.
-        let pop = |t: &mut Vec<Type>| t.pop()
+        // All the places we need it will also need to be Boxed to avoid making ColumnSpec infinitely recursive.
+        let pop = |t: &mut Vec<ColumnSpec>| t.pop()
             .ok_or(OrcError::SchemaError("Missing child type"))
             .map(|x| Box::new(x));
 
         // The types are given in pre-order,
         // and for lack of imagination we iterate the types in reverse order to create the trees bottom-up.
         // Any unclaimed trees are top-level columns.
-        for raw_type in raw_types.iter().rev() {
+        for (id, raw_type) in raw_types.iter().enumerate().rev() {
             // This import helps reduce the noise
             use messages::r#type::Kind;
             let next_type = match raw_type.kind() {
-                Kind::Boolean => Type::Boolean,
-                Kind::Byte => Type::Byte,
-                Kind::Short => Type::Short,
-                Kind::Int => Type::Int,
-                Kind::Long => Type::Long,
-                Kind::Float => Type::Float,
-                Kind::Double => Type::Double,
-                Kind::String => Type::String,
-                Kind::Binary => Type::Binary,
-                Kind::Timestamp => Type::Timestamp,
-                Kind::List => Type::List(pop(&mut roots)?),
+                Kind::Boolean => ColumnSpec::Boolean{id},
+                Kind::Byte => ColumnSpec::Byte{id},
+                Kind::Short => ColumnSpec::Short{id},
+                Kind::Int => ColumnSpec::Int{id},
+                Kind::Long => ColumnSpec::Long{id},
+                Kind::Float => ColumnSpec::Float{id},
+                Kind::Double => ColumnSpec::Double{id},
+                Kind::String => ColumnSpec::String{id},
+                Kind::Binary => ColumnSpec::Binary{id},
+                Kind::Timestamp => ColumnSpec::Timestamp{id},
+                Kind::TimestampInstant => ColumnSpec::TimestampInstant{id},
+                Kind::List => ColumnSpec::List{id, inner: pop(&mut roots)?},
                 Kind::Map => {
                     // Undo reverse subtype order
-                    let (v, k) = (pop(&mut roots)?, pop(&mut roots)?);
-                    Type::Map(k, v)
+                    let (value, key) = (pop(&mut roots)?, pop(&mut roots)?);
+                    ColumnSpec::Map{id, key, value}
                 },
                 Kind::Struct => {
                     if raw_type.field_names.len() != raw_type.subtypes.len() {
@@ -225,24 +226,25 @@ impl<F: Read+Seek> ORCFile<F> {
                     // Keep in mind these subtypes will be in reverse order, note rev() before zip()
                     let subtypes = roots.split_off(roots.len()-raw_type.subtypes.len());
                     // We already own the subtypes but we have to clone the field names
-                    Type::Struct(raw_type.field_names.iter().cloned().zip(subtypes.into_iter().rev()).collect())
+                    let fields = raw_type.field_names.iter().cloned().zip(subtypes.into_iter().rev()).collect();
+                    ColumnSpec::Struct{id, fields}
                 },
                 Kind::Union => return Err(OrcError::SchemaError("Union types are not yet supported")),
-                Kind::Decimal => Type::Decimal{
+                Kind::Decimal => ColumnSpec::Decimal{
+                    id,
                     precision: raw_type.precision() as usize,
                     scale: raw_type.scale() as usize
                 },
-                Kind::Date => Type::Date,
-                Kind::Varchar => Type::Varchar(raw_type.maximum_length() as usize),
-                Kind::Char => Type::Char(raw_type.maximum_length() as usize),
-                Kind::TimestampInstant => Type::TimestampInstant
+                Kind::Date => ColumnSpec::Date{id},
+                Kind::Varchar => ColumnSpec::Varchar{id, length: raw_type.maximum_length() as usize},
+                Kind::Char => ColumnSpec::Char{id, length: raw_type.maximum_length() as usize},
             };
             roots.push(next_type.clone());
             all.push(next_type);
         }
         // I don't see this in the standard but Hive seems to keep everything under one root Struct
         match roots.pop() {
-            Some(Type::Struct(x)) => Ok((x, all)),
+            Some(ColumnSpec::Struct{fields, ..}) => Ok((fields, all)),
             None => Err(OrcError::SchemaError("Top level schema is empty")),
             _ => Err(OrcError::SchemaError("Top level schema was not a struct"))
         }
@@ -251,7 +253,7 @@ impl<F: Read+Seek> ORCFile<F> {
     /// Get a reference to the schema for this file
     ///
     /// Keep in mind that columns can be nested.
-    pub fn schema(&self) -> &[(String, Type)] {
+    pub fn schema(&self) -> &[(String, ColumnSpec)] {
         &self.schema
     }
 
@@ -259,7 +261,7 @@ impl<F: Read+Seek> ORCFile<F> {
     ///
     /// These are still trees, but in this case all subtrees are listed in the top level vector.
     /// Note that for this reason field names are not given. Not all types have field names.
-    pub fn flat_schema(&self) -> &[Type] {
+    pub fn flat_schema(&self) -> &[ColumnSpec] {
         &self.flat_schema
     }
 
@@ -312,32 +314,60 @@ pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
 ///
 /// ORC has a relatively rich type system and supports nested types.
 #[derive(Debug, Eq, PartialEq, Clone)]
-pub enum Type {
-    Boolean,
-    Byte,
-    Short,
-    Int,
-    Long,
-    Float,
-    Double,
-    String,
-    Binary,
-    Timestamp,
-    List(Box<Type>),
+pub enum ColumnSpec {
+    Boolean {id: usize},
+    Byte {id: usize},
+    Short {id: usize},
+    Int {id: usize},
+    Long {id: usize},
+    Float {id: usize},
+    Double {id: usize},
+    String {id: usize},
+    Binary {id: usize},
+    Timestamp {id: usize},
+    // TODO: Why is there a second timestamp type?
+    TimestampInstant {id: usize},
+    List {id: usize, inner: Box<ColumnSpec> },
     /// Maps store keys and values
-    Map(Box<Type>, Box<Type>),
+    Map {id: usize, key: Box<ColumnSpec>, value: Box<ColumnSpec> },
     /// Nested structures are available, with named keys
-    Struct(Vec<(String, Type)>),
-    /// Hive support for Union is spotty, so avoid Union if possible
-    Union(Vec<Type>),
+    Struct {id: usize, fields: Vec<(String, ColumnSpec)> },
+    /// Hive support for Union is spotty, and we don't support it.
+    Union{id: usize},
     Decimal{
+        id: usize,
         precision: usize,
         scale: usize
     },
-    Date,
-    Varchar(usize),
-    Char(usize),
-    TimestampInstant
+    Date {id: usize},
+    Varchar {id: usize, length: usize},
+    Char {id: usize, length: usize}
+}
+impl ColumnSpec {
+    /// Get the column ID of any type
+    pub fn id(&self) -> usize {
+        match self {
+            Self::Boolean{id}
+            | Self::Byte{id}
+            | Self::Short{id}
+            | Self::Int{id}
+            | Self::Long{id}
+            | Self::Float{id}
+            | Self::Double{id}
+            | Self::String{id}
+            | Self::Binary{id}
+            | Self::Timestamp{id}
+            | Self::TimestampInstant{id}
+            | Self::List{id, ..}
+            | Self::Map{id, ..}
+            | Self::Struct{id, ..}
+            | Self::Union{id}
+            | Self::Decimal{id, ..}
+            | Self::Date{id}
+            | Self::Varchar{id, ..}
+            | Self::Char{id, ..} => *id
+        }
+    }
 }
 /// A handle to one stripe in an ORCFile.
 ///
@@ -391,7 +421,7 @@ impl<'t, F:Read+Seek> Stripe<'t, F> {
 pub struct Column {
     id: usize,
     name: Option<String>,
-    typ: Type,
+    typ: ColumnSpec,
     present: Option<codecs::BooleanRLE>,
     content: TypedStream
 }
@@ -399,16 +429,19 @@ impl Column {
     pub fn new(
         id: usize,
         name: Option<String>,
-        typ: Type,
+        typ: ColumnSpec,
         enc: &messages::ColumnEncoding,
-        stream: &[&messages::Stream]
+        streams: &[&messages::Stream]
     ) -> OrcResult<Column> {
-        use messages::column_encoding::Kind as ckind;
-        use messages::stream::Kind as skind;
+        use messages::column_encoding::Kind as Ckind;
+        use messages::stream::Kind as Skind;
         // let stream = match (typ, stream.kind(), enc::kind()) {
-        //     (Type::Boolean, skind::Data, ckind::DIRECT) 
+        //     (ColumnSpec::Boolean, skind::Data, ckind::DIRECT) 
         //     (s, c) => return OrcError::SchemaError(format!("Unsupported encoding {:?} for stream {:?}", c, s)),
         // };
+        let stream_by_kind = |sk: Skind| streams.iter()
+            .find(|stream| stream.kind() == sk)
+            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", id, sk)));
         Ok(Column {
             id, name, typ,
             present: None,
@@ -461,52 +494,64 @@ mod tests {
 
     #[test]
     fn test_read_footer() {
-        use super::Type::*;
+        use super::ColumnSpec as CS;
         let orc_bytes = include_bytes!("sample.orc");
         let orc_toc = super::ORCFile::from_slice(&orc_bytes[..]).unwrap();
         // The metadata is empty
         assert_eq!(orc_toc.user_metadata(), hashmap!{});
         // This is a bit verbose but the point is to stress test the type system
         assert_eq!(orc_toc.schema(), &[
-            ("_col0".into(), Boolean),
-            ("_col1".into(), Byte),
-            ("_col2".into(), Short),
-            ("_col3".into(), Int),
-            ("_col4".into(), Long),
-            ("_col5".into(), Float),
-            ("_col6".into(), Double),
-            ("_col7".into(), Decimal { precision: 10, scale: 0 }),
-            ("_col8".into(), Char(1)),
-            ("_col9".into(), Char(3)),
-            ("_col10".into(), String),
-            ("_col11".into(), Varchar(10)),
-            ("_col12".into(), Binary),
-            ("_col13".into(), Binary),
-            ("_col14".into(), Date),
-            ("_col15".into(), Timestamp),
-            ("_col16".into(), List(Box::new(Int))),
-            ("_col17".into(), List(Box::new(List(Box::new(Int))))),
-            ("_col18".into(), Struct(vec![
-                ("city".into(), String),
-                ("population".into(), Int)
-            ])),
-            ("_col19".into(), Struct(vec![
-                ("city".into(), Struct(vec![
-                    ("name".into(), String),
-                    ("population".into(), Int)
-                ])),
-                ("state".into(), String)
-            ])),
-            ("_col20".into(), List(Box::new(Struct(vec![
-                ("city".into(), String),
-                ("population".into(), Int)
-            ])))),
-            ("_col21".into(), Struct(vec![
-                ("city".into(), List(Box::new(String))),
-                ("population".into(), List(Box::new(Int)))
-            ])),
-            ("_col22".into(), Map(Box::new(Int), Box::new(String))),
-            ("_col23".into(), Map(Box::new(Map(Box::new(Int), Box::new(String))), Box::new(String)))
+            ("_col0".into(), CS::Boolean { id: 1 }),
+            ("_col1".into(), CS::Byte { id: 2 }),
+            ("_col2".into(), CS::Short { id: 3 }),
+            ("_col3".into(), CS::Int { id: 4 }),
+            ("_col4".into(), CS::Long { id: 5 }),
+            ("_col5".into(), CS::Float { id: 6 }),
+            ("_col6".into(), CS::Double { id: 7 }),
+            ("_col7".into(), CS::Decimal { id: 8, precision: 10, scale: 0 }),
+            ("_col8".into(), CS::Char { id: 9, length: 1 }),
+            ("_col9".into(), CS::Char { id: 10, length: 3 }),
+            ("_col10".into(), CS::String { id: 11 }),
+            ("_col11".into(), CS::Varchar { id: 12, length: 10 }),
+            ("_col12".into(), CS::Binary { id: 13 }),
+            ("_col13".into(), CS::Binary { id: 14 }),
+            ("_col14".into(), CS::Date { id: 15 }),
+            ("_col15".into(), CS::Timestamp { id: 16 }),
+            ("_col16".into(), CS::List { id: 17, inner: Box::new(CS::Int { id: 18 }) }),
+            ("_col17".into(), CS::List { id: 19, inner: Box::new(CS::List { id: 20, inner: Box::new(CS::Int { id: 21 }) }) }),
+            ("_col18".into(), CS::Struct { id: 22, fields: vec![
+                ("city".into(), CS::String { id: 23 }),
+                ("population".into(), CS::Int { id: 24 })
+            ] }),
+            ("_col19".into(), CS::Struct { id: 25, fields: vec![
+                ("city".into(), CS::Struct { id: 26, fields: vec![
+                    ("name".into(), CS::String { id: 27 }),
+                    ("population".into(), CS::Int { id: 28 })
+                ] }),
+                ("state".into(), CS::String { id: 29 })
+            ] }),
+            ("_col20".into(), CS::List { id: 30, inner: Box::new(CS::Struct { id: 31, fields: vec![
+                ("city".into(), CS::String { id: 32 }),
+                ("population".into(), CS::Int { id: 33 })
+            ] }) }),
+            ("_col21".into(), CS::Struct { id: 34, fields: vec![
+                ("city".into(), CS::List { id: 35, inner: Box::new(CS::String { id: 36 }) }),
+                ("population".into(), CS::List { id: 37, inner: Box::new(CS::Int { id: 38 }) })
+            ] }),
+            ("_col22".into(), CS::Map {
+                id: 39,
+                key: Box::new(CS::Int { id: 41 }),
+                value: Box::new(CS::String { id: 40 })
+            }),
+            ("_col23".into(), CS::Map {
+                id: 42,
+                key: Box::new(CS::Map {
+                    id: 44,
+                    key: Box::new(CS::Int { id: 46 }),
+                    value: Box::new(CS::String { id: 45 })
+                }),
+                value: Box::new(CS::String { id: 43 })
+            })
         ]);
     }
 
