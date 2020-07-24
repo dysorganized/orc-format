@@ -12,21 +12,38 @@ pub mod messages {
 }
 
 pub(crate) mod codecs {
+    use std::ops::Range;
     use crate::errors::{OrcError, OrcResult};
     /// Boolean run length encoding
-    pub struct BooleanRLE();
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct BooleanRLE(pub Range<u64>);
     /// One-byte signed integer run length encoding
-    pub struct ByteRLE();
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct ByteRLE(pub Range<u64>);
     /// Variable width signed integer run length encoding
-    pub enum IntRLE {V1, V2}
+    #[derive(Debug, Eq, PartialEq)]
+    pub enum IntRLE {
+        V1(Range<u64>),
+        V2(Range<u64>)
+    }
     /// Variable width unsigned integer run length encoding
-    pub enum UintRLE {V1, V2}
+    #[derive(Debug, Eq, PartialEq)]
+    pub enum UintRLE {
+        V1(Range<u64>),
+        V2(Range<u64>)
+    }
     /// IEEE754 Float encoding
-    pub struct FloatEnc();
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct FloatEnc(pub Range<u64>);
     /// Literal byte sequence without any encoding
-    pub struct BinaryEnc();
+    #[derive(Debug, Eq, PartialEq)]
+    pub struct BinaryEnc(pub Range<u64>);
     /// Timestamp nanosecond encoding (handles trailing zeros specially)
-    pub struct NanosEnc();
+    #[derive(Debug, Eq, PartialEq)]
+    pub enum NanosEnc{
+        V1(Range<u64>),
+        V2(Range<u64>)
+    }
 
     /// Decode a signed varint128 from a slice
     ///
@@ -211,8 +228,8 @@ impl<F: Read+Seek> ORCFile<F> {
                 Kind::Double => ColumnSpec::Double{id},
                 Kind::String => ColumnSpec::String{id},
                 Kind::Binary => ColumnSpec::Binary{id},
-                Kind::Timestamp => ColumnSpec::Timestamp{id},
-                Kind::TimestampInstant => ColumnSpec::TimestampInstant{id},
+                Kind::Timestamp
+                | Kind::TimestampInstant => ColumnSpec::Timestamp{id},
                 Kind::List => ColumnSpec::List{id, inner: pop(&mut roots)?},
                 Kind::Map => {
                     // Undo reverse subtype order
@@ -242,6 +259,8 @@ impl<F: Read+Seek> ORCFile<F> {
             roots.push(next_type.clone());
             all.push(next_type);
         }
+        // The flat schema is backward at this point
+        all.reverse();
         // I don't see this in the standard but Hive seems to keep everything under one root Struct
         match roots.pop() {
             Some(ColumnSpec::Struct{fields, ..}) => Ok((fields, all)),
@@ -325,8 +344,7 @@ pub enum ColumnSpec {
     String {id: usize},
     Binary {id: usize},
     Timestamp {id: usize},
-    // TODO: Why is there a second timestamp type?
-    TimestampInstant {id: usize},
+    // TODO: Why is there a second timestamp type named TimestampInstant?
     List {id: usize, inner: Box<ColumnSpec> },
     /// Maps store keys and values
     Map {id: usize, key: Box<ColumnSpec>, value: Box<ColumnSpec> },
@@ -357,7 +375,6 @@ impl ColumnSpec {
             | Self::String{id}
             | Self::Binary{id}
             | Self::Timestamp{id}
-            | Self::TimestampInstant{id}
             | Self::List{id, ..}
             | Self::Map{id, ..}
             | Self::Struct{id, ..}
@@ -409,43 +426,92 @@ impl<'t, F:Read+Seek> Stripe<'t, F> {
         }
         let mut cols = vec![];
         for id in 0..flat_schema.len() {
-            cols.push(match (&flat_schema[id], self.footer.columns[id].kind()) {
-                _ => todo!("No columns are implemented yet")
-            })
+            cols.push(Column::new(
+                &flat_schema[id], 
+                &self.footer.columns[id], 
+                &self.footer.streams[..])?
+            );
         }
         Ok(cols)
     }
 
 }
-
+#[derive(Debug, Eq, PartialEq)]
 pub struct Column {
-    id: usize,
-    name: Option<String>,
-    typ: ColumnSpec,
+    spec: ColumnSpec,
     present: Option<codecs::BooleanRLE>,
     content: TypedStream
 }
 impl Column {
     pub fn new(
-        id: usize,
-        name: Option<String>,
-        typ: ColumnSpec,
+        spec: &ColumnSpec,
         enc: &messages::ColumnEncoding,
-        streams: &[&messages::Stream]
+        streams: &[messages::Stream]
     ) -> OrcResult<Column> {
         use messages::column_encoding::Kind as Ckind;
         use messages::stream::Kind as Skind;
-        // let stream = match (typ, stream.kind(), enc::kind()) {
-        //     (ColumnSpec::Boolean, skind::Data, ckind::DIRECT) 
-        //     (s, c) => return OrcError::SchemaError(format!("Unsupported encoding {:?} for stream {:?}", c, s)),
-        // };
-        let stream_by_kind = |sk: Skind| streams.iter()
-            .find(|stream| stream.kind() == sk)
-            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", id, sk)));
+        let range_by_kind = |sk: Skind| streams.iter()
+            .scan(0u64, |cur, st| {
+                // The offset of each stream is the cumulative sum of the lengths
+                let start = *cur;
+                *cur += st.length();
+                Some((start..*cur, st))
+            })
+            .find(|(_, stream)| stream.column() as usize == spec.id() && stream.kind() == sk)
+            .map(|(rng, _) | rng)
+            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", spec.id(), sk)));
+        // Most colspecs need these streams, so tee them up to save writing
+        let data = range_by_kind(Skind::Data);
+        let len = range_by_kind(Skind::Length);
+
+        // These integer encodings are mostly orthogonal to the types
+        let int_enc = |r| match enc.kind() {
+            Ckind::Direct | Ckind::Dictionary => codecs::IntRLE::V1(r),
+            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::IntRLE::V2(r)
+        };
+        let uint_enc = |r| match enc.kind() {
+            Ckind::Direct | Ckind::Dictionary => codecs::UintRLE::V1(r),
+            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::UintRLE::V2(r)
+        };
+        let content = match spec {
+            ColumnSpec::Boolean{..} => TypedStream::Boolean{data: codecs::BooleanRLE(data?)},
+            ColumnSpec::Byte{..}   => TypedStream::Byte{data: codecs::ByteRLE(data?)},
+            ColumnSpec::Short{..}
+            | ColumnSpec::Int{..}
+            | ColumnSpec::Long{..}
+            | ColumnSpec::Date{..} => TypedStream::Int{data: int_enc(data?)},
+            ColumnSpec::Float{..}
+            | ColumnSpec::Double{..} => TypedStream::Float{data: codecs::FloatEnc(data?)},
+            ColumnSpec::Decimal{..} => TypedStream::Decimal{
+                data: int_enc(data?),
+                scale: int_enc(range_by_kind(Skind::Secondary)?)
+            },
+            ColumnSpec::String{..}
+            | ColumnSpec::Varchar{..}
+            | ColumnSpec::Char{..}
+            | ColumnSpec::Binary{..} => TypedStream::Blob{
+                data: codecs::BinaryEnc(data?),
+                length: uint_enc(len?)
+            },
+            ColumnSpec::Map{..}
+            | ColumnSpec::List{..} => TypedStream::Container{length: uint_enc(len?)},
+            ColumnSpec::Struct{..} => TypedStream::Struct(),
+            ColumnSpec::Timestamp{..} => TypedStream::Timestamp{
+                seconds: int_enc(data?),
+                nanos: match enc.kind() {
+                    Ckind::Direct => codecs::NanosEnc::V1(range_by_kind(Skind::Secondary)?),
+                    Ckind::DirectV2 => codecs::NanosEnc::V2(range_by_kind(Skind::Secondary)?),
+                    _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
+                }
+            },
+            ColumnSpec::Union{..} => return Err(OrcError::SchemaError("Union types are not supported")),
+        };
         Ok(Column {
-            id, name, typ,
-            present: None,
-            content: TypedStream::Int{ data: codecs::IntRLE::V2 }
+            spec: spec.clone(),
+            present: range_by_kind(Skind::Present)
+                .map(|r| codecs::BooleanRLE(r))
+                .ok(),
+            content
         })
     }
 }
@@ -453,18 +519,21 @@ impl Column {
 /// Joins multiple streams to create different composite types
 ///
 /// This is where variable length types, like strings, are handled.
-/// 
+#[derive(Debug, Eq, PartialEq)]
 pub enum TypedStream {
+    /// Boolean RLE
+    Boolean {data: codecs::BooleanRLE},
     /// RLE encoding for 8-bit integers and UNIONS. Unions aren't supported.
     Byte {data: codecs::ByteRLE},
-    /// `DIRECT` encoding, for all int sizes, booleans, bytes, dates, maps, and lists.  
+    /// `DIRECT` encoding, for all int sizes, booleans, bytes, dates.
     /// For dates, the data is the days since 1970.  
-    /// For maps and lists, the data is the length.  
     Int {data: codecs::IntRLE},
     /// `DIRECT` encoding for floats
     Float {data: codecs::FloatEnc},
     /// `DIRECT` encoding for chars, strings, varchars, and blobs
-    Blob {data: codecs::BinaryEnc, length: codecs::IntRLE},
+    Blob {data: codecs::BinaryEnc, length: codecs::UintRLE},
+    /// For maps and lists, the data is the length.
+    Container {length: codecs::UintRLE},
     /// `DICTIONARY` encoding, only for chars, strings and varshars (not blobs)
     Dict {data: codecs::IntRLE, length: codecs::UintRLE, dict: codecs::BinaryEnc},
     /// Decimals, which store i128's with an associated scale.
@@ -557,9 +626,63 @@ mod tests {
 
     #[test]
     fn test_stripe() {
+        use super::Column;
+        use super::codecs::*;
+        use super::TypedStream as TS;
+        use super::ColumnSpec as CS;
         let orc_bytes = include_bytes!("sample.orc");
         let mut orc_toc = super::ORCFile::from_slice(&orc_bytes[..]).unwrap();
+        let specs = orc_toc.flat_schema().to_vec();
         let stripe = orc_toc.stripe(0).unwrap();
         assert_eq!(stripe.number_of_rows(), 3);
+        assert_eq!(stripe.columns().unwrap(), vec![
+            Column { spec: specs[0].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[1].clone(), present: Some(BooleanRLE(1149..1154)), content: TS::Boolean { data: BooleanRLE(1154..1159) } },
+            Column { spec: specs[2].clone(), present: Some(BooleanRLE(1159..1164)), content: TS::Byte { data: ByteRLE(1164..1170) } },
+            Column { spec: specs[3].clone(), present: Some(BooleanRLE(1170..1175)), content: TS::Int { data: IntRLE::V2(1175..1182) } },
+            Column { spec: specs[4].clone(), present: Some(BooleanRLE(1182..1187)), content: TS::Int { data: IntRLE::V2(1187..1194) } },
+            Column { spec: specs[5].clone(), present: Some(BooleanRLE(1194..1199)), content: TS::Int { data: IntRLE::V2(1199..1206) } },
+            Column { spec: specs[6].clone(), present: Some(BooleanRLE(1206..1211)), content: TS::Float { data: FloatEnc(1211..1222) } },
+            Column { spec: specs[7].clone(), present: Some(BooleanRLE(1222..1227)), content: TS::Float { data: FloatEnc(1227..1242) } },
+            Column { spec: specs[8].clone(), present: Some(BooleanRLE(1242..1247)), content: TS::Decimal { data: IntRLE::V2(1247..1252), scale: IntRLE::V2(1252..1258) } },
+            Column { spec: specs[9].clone(), present: Some(BooleanRLE(1258..1263)), content: TS::Blob { data: BinaryEnc(1263..1268), length: UintRLE::V2(1268..1274) } },
+            Column { spec: specs[10].clone(), present: Some(BooleanRLE(1274..1279)), content: TS::Blob { data: BinaryEnc(1279..1288), length: UintRLE::V2(1288..1294) } },
+            Column { spec: specs[11].clone(), present: Some(BooleanRLE(1294..1299)), content: TS::Blob { data: BinaryEnc(1299..1305), length: UintRLE::V2(1305..1311) } },
+            Column { spec: specs[12].clone(), present: Some(BooleanRLE(1311..1316)), content: TS::Blob { data: BinaryEnc(1316..1322), length: UintRLE::V2(1322..1328) } },
+            Column { spec: specs[13].clone(), present: Some(BooleanRLE(1328..1333)), content: TS::Blob { data: BinaryEnc(1333..1339), length: UintRLE::V2(1339..1345) } },
+            Column { spec: specs[14].clone(), present: Some(BooleanRLE(1345..1350)), content: TS::Blob { data: BinaryEnc(1350..1358), length: UintRLE::V2(1358..1364) } },
+            Column { spec: specs[15].clone(), present: Some(BooleanRLE(1364..1369)), content: TS::Int { data: IntRLE::V2(1369..1380) } },
+            Column { spec: specs[16].clone(), present: Some(BooleanRLE(1380..1385)), content: TS::Timestamp { seconds: IntRLE::V2(1385..1398), nanos: NanosEnc::V2(1398..1407) } },
+            Column { spec: specs[17].clone(), present: None, content: TS::Container { length: UintRLE::V2(1407..1412) } },
+            Column { spec: specs[18].clone(), present: Some(BooleanRLE(1412..1418)), content: TS::Int { data: IntRLE::V2(1418..1428) } },
+            Column { spec: specs[19].clone(), present: None, content: TS::Container { length: UintRLE::V2(1428..1433) } },
+            Column { spec: specs[20].clone(), present: None, content: TS::Container { length: UintRLE::V2(1433..1438) } },
+            Column { spec: specs[21].clone(), present: Some(BooleanRLE(1438..1444)), content: TS::Int { data: IntRLE::V2(1444..1454) } },
+            Column { spec: specs[22].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[23].clone(), present: None, content: TS::Blob { data: BinaryEnc(1454..1459), length: UintRLE::V2(1459..1465) } },
+            Column { spec: specs[24].clone(), present: Some(BooleanRLE(1479..1484)), content: TS::Int { data: IntRLE::V2(1484..1491) } },
+            Column { spec: specs[25].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[26].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[27].clone(), present: None, content: TS::Blob { data: BinaryEnc(1491..1496), length: UintRLE::V2(1496..1502) } },
+            Column { spec: specs[28].clone(), present: Some(BooleanRLE(1516..1521)), content: TS::Int { data: IntRLE::V2(1521..1528) } },
+            Column { spec: specs[29].clone(), present: None, content: TS::Blob { data: BinaryEnc(1528..1533), length: UintRLE::V2(1533..1539) } },
+            Column { spec: specs[30].clone(), present: None, content: TS::Container { length: UintRLE::V2(1544..1549) } },
+            Column { spec: specs[31].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[32].clone(), present: None, content: TS::Blob { data: BinaryEnc(1549..1555), length: UintRLE::V2(1555..1561) } },
+            Column { spec: specs[33].clone(), present: Some(BooleanRLE(1582..1587)), content: TS::Int { data: IntRLE::V2(1587..1600) } },
+            Column { spec: specs[34].clone(), present: None, content: TS::Struct() },
+            Column { spec: specs[35].clone(), present: None, content: TS::Container { length: UintRLE::V2(1600..1605) } },
+            Column { spec: specs[36].clone(), present: None, content: TS::Blob { data: BinaryEnc(1605..1611), length: UintRLE::V2(1611..1617) } },
+            Column { spec: specs[37].clone(), present: None, content: TS::Container { length: UintRLE::V2(1638..1643) } },
+            Column { spec: specs[38].clone(), present: Some(BooleanRLE(1643..1648)), content: TS::Int { data: IntRLE::V2(1648..1661) } },
+            Column { spec: specs[39].clone(), present: None, content: TS::Container { length: UintRLE::V2(1661..1666) } },
+            Column { spec: specs[40].clone(), present: None, content: TS::Blob { data: BinaryEnc(1666..1672), length: UintRLE::V2(1672..1678) } },
+            Column { spec: specs[41].clone(), present: Some(BooleanRLE(1690..1695)), content: TS::Int { data: IntRLE::V2(1695..1708) } },
+            Column { spec: specs[42].clone(), present: None, content: TS::Container { length: UintRLE::V2(1708..1713) } },
+            Column { spec: specs[43].clone(), present: None, content: TS::Blob { data: BinaryEnc(1713..1718), length: UintRLE::V2(1718..1724) } },
+            Column { spec: specs[44].clone(), present: None, content: TS::Container { length: UintRLE::V2(1731..1736) } },
+            Column { spec: specs[45].clone(), present: None, content: TS::Blob { data: BinaryEnc(1736..1741), length: UintRLE::V2(1741..1747) } },
+            Column { spec: specs[46].clone(), present: Some(BooleanRLE(1755..1760)), content: TS::Int { data: IntRLE::V2(1760..1769) } }
+        ]);
     }
 }
