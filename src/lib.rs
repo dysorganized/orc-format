@@ -31,15 +31,45 @@ impl<F: Read+Seek> ORCFile<F> {
     fn read_message<M: Message+Default>(&mut self, start: u64, end: u64) -> OrcResult<M> {
         // Read the compressed data from the file first
         self.file.seek(SeekFrom::Start(start as u64))?;
-        let mut comp_buffer = vec![0u8; (end-start) as usize];
-        self.file.read_exact(&mut comp_buffer)?;
+        let mut comp_buffer_back = vec![0u8; (end-start) as usize];
+        self.file.read_exact(&mut comp_buffer_back)?;
+        let mut comp_buffer = &comp_buffer_back[..];
 
         // Start decompressing
         let mut decomp_buffer= vec![];
-        if comp_buffer.len() < 4 {
-            // We need to guarantee there are three bytes for the length
-            // but for my sanity let's assume there is at least one byte of content
-            return Err(OrcError::TruncatedError);
+        while comp_buffer.len() >= 4 {
+            let (chunk_len, is_compressed) = match self.postscript.compression() {
+                // Messages without compression have no header
+                messages::CompressionKind::None => (0, false),
+                _ => {
+                    let enc = [comp_buffer[0], comp_buffer[1], comp_buffer[2], 0];
+                    let enc_len = u32::from_le_bytes(enc);
+                    ((enc_len / 2) as usize, (enc_len & 1 == 0))
+                }
+            };
+            match (is_compressed, self.postscript.compression()) {
+                (false, messages::CompressionKind::None) => {
+                    // Messages without compression have no header
+                    decomp_buffer.extend_from_slice(&comp_buffer);
+                }
+                (false, _) => {
+                    // Messages with compression, but where this block is uncompressed still have a header
+                    decomp_buffer.extend_from_slice(&comp_buffer[3..chunk_len+3]);
+                }
+                (true, messages::CompressionKind::Zlib) => {
+                    let mut decoder = flate2::read::DeflateDecoder::new(&comp_buffer[3..chunk_len+3]);
+                    decoder.read_to_end(&mut decomp_buffer)?;
+                }
+                (true, messages::CompressionKind::Snappy) => {
+                    let mut decoder = snap::read::FrameDecoder::new(&comp_buffer[3..chunk_len+3]);
+                    decoder.read_to_end(&mut decomp_buffer)?;
+                }
+                _ => todo!("Only Zlib and Snappy compression are supported yet.")
+                // Lzo = 3,
+                // Lz4 = 4,
+                // Zstd = 5,
+            };
+            comp_buffer = &comp_buffer[chunk_len+3..];
         }
         let (chunk_len, is_compressed) = match self.postscript.compression() {
             messages::CompressionKind::None => (0, false),
