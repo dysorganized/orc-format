@@ -329,7 +329,6 @@ impl Schema {
 /// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
 pub struct Stripe<'t, F:Read+Seek> {
     file: &'t mut ORCFile<F>,
-    id: usize,
     info: messages::StripeInformation,
     footer: messages::StripeFooter
 }
@@ -343,7 +342,7 @@ impl<'t, F:Read+Seek> Stripe<'t, F> {
             info.offset() + info.index_length() + info.data_length(), 
             info.offset() + info.index_length() + info.data_length() + info.footer_length()
         )?;
-        Ok(Stripe {id, info, footer, file})
+        Ok(Stripe {info, footer, file})
     }
 
     /// Number of rows in this stripe
@@ -352,14 +351,14 @@ impl<'t, F:Read+Seek> Stripe<'t, F> {
     }
 
     /// Return the columns available in this stripe
-    pub fn columns(&self) -> OrcResult<Vec<Column>> {
+    pub fn columns(&self) -> OrcResult<Vec<ColumnRef>> {
         let flat_schema = self.file.flat_schema();
         if self.footer.columns.len() != flat_schema.len() {
             return Err(OrcError::SchemaError("Stripe column definitions don't match schema"))
         }
         let mut cols = vec![];
         for id in 0..flat_schema.len() {
-            cols.push(Column::new(
+            cols.push(ColumnRef::new(
                 &flat_schema[id], 
                 &self.footer.columns[id], 
                 &self.footer.streams[..])?
@@ -370,17 +369,17 @@ impl<'t, F:Read+Seek> Stripe<'t, F> {
 
 }
 #[derive(Debug, Eq, PartialEq)]
-pub struct Column {
-    spec: Schema,
+pub struct ColumnRef {
+    schema: Schema,
     present: Option<Encoded>,
     content: ColumnSpec
 }
-impl Column {
+impl ColumnRef {
     pub fn new(
-        spec: &Schema,
+        schema: &Schema,
         enc: &messages::ColumnEncoding,
         streams: &[messages::Stream]
-    ) -> OrcResult<Column> {
+    ) -> OrcResult<ColumnRef> {
         use messages::column_encoding::Kind as Ckind;
         use messages::stream::Kind as Skind;
         let range_by_kind = |sk: Skind| streams.iter()
@@ -390,9 +389,9 @@ impl Column {
                 *cur += st.length();
                 Some((start..*cur, st))
             })
-            .find(|(_, stream)| stream.column() as usize == spec.id() && stream.kind() == sk)
+            .find(|(_, stream)| stream.column() as usize == schema.id() && stream.kind() == sk)
             .map(|(rng, _) | rng)
-            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", spec.id(), sk)));
+            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", schema.id(), sk)));
         // Most colspecs need these streams, so tee them up to save writing
         let data = range_by_kind(Skind::Data);
         let len = range_by_kind(Skind::Length);
@@ -406,7 +405,7 @@ impl Column {
             Ckind::Direct | Ckind::Dictionary => Encoded(Codec::UintRLE1, r),
             Ckind::DirectV2 | Ckind::DictionaryV2 => Encoded(Codec::UintRLE2, r)
         };
-        let content = match spec {
+        let content = match schema {
             Schema::Boolean{..} => ColumnSpec::Boolean{data: Encoded(Codec::BooleanRLE, data?)},
             Schema::Byte{..}   => ColumnSpec::Byte{data: Encoded(Codec::ByteRLE, data?)},
             Schema::Short{..}
@@ -439,8 +438,8 @@ impl Column {
             },
             Schema::Union{..} => return Err(OrcError::SchemaError("Union types are not supported")),
         };
-        Ok(Column {
-            spec: spec.clone(),
+        Ok(ColumnRef {
+            schema: schema.clone(),
             present: range_by_kind(Skind::Present)
                 .map(|r| Encoded(Codec::BooleanRLE, r))
                 .ok(),
@@ -496,7 +495,7 @@ pub enum Codec {
     UintRLE1,
     /// Variable width unsigned integer run length encoding (for Hive >= 0.12)
     UintRLE2,
-    /// Fixed width floating point IEEE754
+    /// Fixed width floating point IEEE754. Essentially raw.
     FloatEnc,
     /// Raw uncompressed slice, no encoding
     BinaryEnc,
@@ -539,6 +538,59 @@ impl Codec {
         Err(OrcError::TruncatedError)
     }
 }
+
+/// Byte level RLE, encoding up to 128 byte literals and up to 130 byte runs
+/// It works pretty much like it sounds, a flag followed by a string (for literals),
+/// or by a single byte (for runs)
+#[derive(Debug)]
+pub(crate) struct ByteRLEDecoder<'t> {
+    content: &'t [u8],
+    run: isize,
+    run_item: u8,
+    literal: isize
+}
+impl<'t> From<&'t[u8]> for ByteRLEDecoder<'t> {
+    fn from(content: &'t[u8]) -> Self {
+        ByteRLEDecoder {content, run:0, literal:0, run_item:0}
+    }
+}
+impl<'t> Iterator for ByteRLEDecoder<'t> {
+    type Item = u8;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.content.is_empty() {
+            // Nothing left (even if it's the middle of a run or literal)
+            None
+        } else if self.run > 0 {
+            // Repeat the last byte
+            self.run -= 1;
+            Some(self.run_item)
+        } else if self.literal > 0 {
+            // Consume a byte
+            self.literal -= 1;
+            let first = self.content[0];
+            self.content = &self.content[1..];
+            Some(first)
+        } else if self.content.len() < 2 {
+            // All other branches need two bytes
+            None
+        } else {
+            // Start the next run
+            let flag = self.content[0] as i8;
+            if flag < 0 {
+                self.literal = -(flag as isize);
+                self.content = &self.content[1..];
+            } else {
+                // The minimum run size is 3, so they hard coded that
+                self.run = 3 + (flag as isize);
+                self.run_item = self.content[1];
+                self.content = &self.content[2..];
+            }
+            self.next()
+        }
+    }
+}
+
+
 
 #[cfg(test)]
 mod tests {
@@ -621,60 +673,67 @@ mod tests {
 
     #[test]
     fn test_stripe() {
-        use super::{Column, Encoded, Codec, ColumnSpec as TS};
+        use super::{ColumnRef, Encoded, Codec, ColumnSpec as TS};
         let orc_bytes = include_bytes!("sample.orc");
         let mut orc_toc = super::ORCFile::from_slice(&orc_bytes[..]).unwrap();
-        let specs = orc_toc.flat_schema().to_vec();
+        let schema = orc_toc.flat_schema().to_vec();
         let stripe = orc_toc.stripe(0).unwrap();
         assert_eq!(stripe.number_of_rows(), 3);
         assert_eq!(stripe.columns().unwrap(), vec![
-            Column { spec: specs[0].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[1].clone(), present: Some(Encoded(Codec::BooleanRLE, 1149..1154)), content: TS::Boolean { data: Encoded(Codec::BooleanRLE, 1154..1159) } },
-            Column { spec: specs[2].clone(), present: Some(Encoded(Codec::BooleanRLE, 1159..1164)), content: TS::Byte { data: Encoded(Codec::ByteRLE, 1164..1170) } },
-            Column { spec: specs[3].clone(), present: Some(Encoded(Codec::BooleanRLE, 1170..1175)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1175..1182) } },
-            Column { spec: specs[4].clone(), present: Some(Encoded(Codec::BooleanRLE, 1182..1187)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1187..1194) } },
-            Column { spec: specs[5].clone(), present: Some(Encoded(Codec::BooleanRLE, 1194..1199)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1199..1206) } },
-            Column { spec: specs[6].clone(), present: Some(Encoded(Codec::BooleanRLE, 1206..1211)), content: TS::Float { data: Encoded(Codec::FloatEnc, 1211..1222) } },
-            Column { spec: specs[7].clone(), present: Some(Encoded(Codec::BooleanRLE, 1222..1227)), content: TS::Float { data: Encoded(Codec::FloatEnc, 1227..1242) } },
-            Column { spec: specs[8].clone(), present: Some(Encoded(Codec::BooleanRLE, 1242..1247)), content: TS::Decimal { data: Encoded(Codec::IntRLE2, 1247..1252), scale: Encoded(Codec::IntRLE2, 1252..1258) } },
-            Column { spec: specs[9].clone(), present: Some(Encoded(Codec::BooleanRLE, 1258..1263)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1263..1268), length: Encoded(Codec::UintRLE2, 1268..1274) } },
-            Column { spec: specs[10].clone(), present: Some(Encoded(Codec::BooleanRLE, 1274..1279)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1279..1288), length: Encoded(Codec::UintRLE2, 1288..1294) } },
-            Column { spec: specs[11].clone(), present: Some(Encoded(Codec::BooleanRLE, 1294..1299)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1299..1305), length: Encoded(Codec::UintRLE2, 1305..1311) } },
-            Column { spec: specs[12].clone(), present: Some(Encoded(Codec::BooleanRLE, 1311..1316)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1316..1322), length: Encoded(Codec::UintRLE2, 1322..1328) } },
-            Column { spec: specs[13].clone(), present: Some(Encoded(Codec::BooleanRLE, 1328..1333)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1333..1339), length: Encoded(Codec::UintRLE2, 1339..1345) } },
-            Column { spec: specs[14].clone(), present: Some(Encoded(Codec::BooleanRLE, 1345..1350)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1350..1358), length: Encoded(Codec::UintRLE2, 1358..1364) } },
-            Column { spec: specs[15].clone(), present: Some(Encoded(Codec::BooleanRLE, 1364..1369)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1369..1380) } },
-            Column { spec: specs[16].clone(), present: Some(Encoded(Codec::BooleanRLE, 1380..1385)), content: TS::Timestamp { seconds: Encoded(Codec::IntRLE2, 1385..1398), nanos: Encoded(Codec::NanosEnc2, 1398..1407) } },
-            Column { spec: specs[17].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1407..1412) } },
-            Column { spec: specs[18].clone(), present: Some(Encoded(Codec::BooleanRLE, 1412..1418)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1418..1428) } },
-            Column { spec: specs[19].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1428..1433) } },
-            Column { spec: specs[20].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1433..1438) } },
-            Column { spec: specs[21].clone(), present: Some(Encoded(Codec::BooleanRLE, 1438..1444)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1444..1454) } },
-            Column { spec: specs[22].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[23].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1454..1459), length: Encoded(Codec::UintRLE2, 1459..1465) } },
-            Column { spec: specs[24].clone(), present: Some(Encoded(Codec::BooleanRLE, 1479..1484)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1484..1491) } },
-            Column { spec: specs[25].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[26].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[27].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1491..1496), length: Encoded(Codec::UintRLE2, 1496..1502) } },
-            Column { spec: specs[28].clone(), present: Some(Encoded(Codec::BooleanRLE, 1516..1521)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1521..1528) } },
-            Column { spec: specs[29].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1528..1533), length: Encoded(Codec::UintRLE2, 1533..1539) } },
-            Column { spec: specs[30].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1544..1549) } },
-            Column { spec: specs[31].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[32].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1549..1555), length: Encoded(Codec::UintRLE2, 1555..1561) } },
-            Column { spec: specs[33].clone(), present: Some(Encoded(Codec::BooleanRLE, 1582..1587)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1587..1600) } },
-            Column { spec: specs[34].clone(), present: None, content: TS::Struct() },
-            Column { spec: specs[35].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1600..1605) } },
-            Column { spec: specs[36].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1605..1611), length: Encoded(Codec::UintRLE2, 1611..1617) } },
-            Column { spec: specs[37].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1638..1643) } },
-            Column { spec: specs[38].clone(), present: Some(Encoded(Codec::BooleanRLE, 1643..1648)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1648..1661) } },
-            Column { spec: specs[39].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1661..1666) } },
-            Column { spec: specs[40].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1666..1672), length: Encoded(Codec::UintRLE2, 1672..1678) } },
-            Column { spec: specs[41].clone(), present: Some(Encoded(Codec::BooleanRLE, 1690..1695)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1695..1708) } },
-            Column { spec: specs[42].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1708..1713) } },
-            Column { spec: specs[43].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1713..1718), length: Encoded(Codec::UintRLE2, 1718..1724) } },
-            Column { spec: specs[44].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1731..1736) } },
-            Column { spec: specs[45].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1736..1741), length: Encoded(Codec::UintRLE2, 1741..1747) } },
-            Column { spec: specs[46].clone(), present: Some(Encoded(Codec::BooleanRLE, 1755..1760)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1760..1769) } }
+            ColumnRef { schema: schema[0].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[1].clone(), present: Some(Encoded(Codec::BooleanRLE, 1149..1154)), content: TS::Boolean { data: Encoded(Codec::BooleanRLE, 1154..1159) } },
+            ColumnRef { schema: schema[2].clone(), present: Some(Encoded(Codec::BooleanRLE, 1159..1164)), content: TS::Byte { data: Encoded(Codec::ByteRLE, 1164..1170) } },
+            ColumnRef { schema: schema[3].clone(), present: Some(Encoded(Codec::BooleanRLE, 1170..1175)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1175..1182) } },
+            ColumnRef { schema: schema[4].clone(), present: Some(Encoded(Codec::BooleanRLE, 1182..1187)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1187..1194) } },
+            ColumnRef { schema: schema[5].clone(), present: Some(Encoded(Codec::BooleanRLE, 1194..1199)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1199..1206) } },
+            ColumnRef { schema: schema[6].clone(), present: Some(Encoded(Codec::BooleanRLE, 1206..1211)), content: TS::Float { data: Encoded(Codec::FloatEnc, 1211..1222) } },
+            ColumnRef { schema: schema[7].clone(), present: Some(Encoded(Codec::BooleanRLE, 1222..1227)), content: TS::Float { data: Encoded(Codec::FloatEnc, 1227..1242) } },
+            ColumnRef { schema: schema[8].clone(), present: Some(Encoded(Codec::BooleanRLE, 1242..1247)), content: TS::Decimal { data: Encoded(Codec::IntRLE2, 1247..1252), scale: Encoded(Codec::IntRLE2, 1252..1258) } },
+            ColumnRef { schema: schema[9].clone(), present: Some(Encoded(Codec::BooleanRLE, 1258..1263)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1263..1268), length: Encoded(Codec::UintRLE2, 1268..1274) } },
+            ColumnRef { schema: schema[10].clone(), present: Some(Encoded(Codec::BooleanRLE, 1274..1279)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1279..1288), length: Encoded(Codec::UintRLE2, 1288..1294) } },
+            ColumnRef { schema: schema[11].clone(), present: Some(Encoded(Codec::BooleanRLE, 1294..1299)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1299..1305), length: Encoded(Codec::UintRLE2, 1305..1311) } },
+            ColumnRef { schema: schema[12].clone(), present: Some(Encoded(Codec::BooleanRLE, 1311..1316)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1316..1322), length: Encoded(Codec::UintRLE2, 1322..1328) } },
+            ColumnRef { schema: schema[13].clone(), present: Some(Encoded(Codec::BooleanRLE, 1328..1333)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1333..1339), length: Encoded(Codec::UintRLE2, 1339..1345) } },
+            ColumnRef { schema: schema[14].clone(), present: Some(Encoded(Codec::BooleanRLE, 1345..1350)), content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1350..1358), length: Encoded(Codec::UintRLE2, 1358..1364) } },
+            ColumnRef { schema: schema[15].clone(), present: Some(Encoded(Codec::BooleanRLE, 1364..1369)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1369..1380) } },
+            ColumnRef { schema: schema[16].clone(), present: Some(Encoded(Codec::BooleanRLE, 1380..1385)), content: TS::Timestamp { seconds: Encoded(Codec::IntRLE2, 1385..1398), nanos: Encoded(Codec::NanosEnc2, 1398..1407) } },
+            ColumnRef { schema: schema[17].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1407..1412) } },
+            ColumnRef { schema: schema[18].clone(), present: Some(Encoded(Codec::BooleanRLE, 1412..1418)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1418..1428) } },
+            ColumnRef { schema: schema[19].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1428..1433) } },
+            ColumnRef { schema: schema[20].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1433..1438) } },
+            ColumnRef { schema: schema[21].clone(), present: Some(Encoded(Codec::BooleanRLE, 1438..1444)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1444..1454) } },
+            ColumnRef { schema: schema[22].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[23].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1454..1459), length: Encoded(Codec::UintRLE2, 1459..1465) } },
+            ColumnRef { schema: schema[24].clone(), present: Some(Encoded(Codec::BooleanRLE, 1479..1484)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1484..1491) } },
+            ColumnRef { schema: schema[25].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[26].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[27].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1491..1496), length: Encoded(Codec::UintRLE2, 1496..1502) } },
+            ColumnRef { schema: schema[28].clone(), present: Some(Encoded(Codec::BooleanRLE, 1516..1521)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1521..1528) } },
+            ColumnRef { schema: schema[29].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1528..1533), length: Encoded(Codec::UintRLE2, 1533..1539) } },
+            ColumnRef { schema: schema[30].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1544..1549) } },
+            ColumnRef { schema: schema[31].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[32].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1549..1555), length: Encoded(Codec::UintRLE2, 1555..1561) } },
+            ColumnRef { schema: schema[33].clone(), present: Some(Encoded(Codec::BooleanRLE, 1582..1587)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1587..1600) } },
+            ColumnRef { schema: schema[34].clone(), present: None, content: TS::Struct() },
+            ColumnRef { schema: schema[35].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1600..1605) } },
+            ColumnRef { schema: schema[36].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1605..1611), length: Encoded(Codec::UintRLE2, 1611..1617) } },
+            ColumnRef { schema: schema[37].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1638..1643) } },
+            ColumnRef { schema: schema[38].clone(), present: Some(Encoded(Codec::BooleanRLE, 1643..1648)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1648..1661) } },
+            ColumnRef { schema: schema[39].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1661..1666) } },
+            ColumnRef { schema: schema[40].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1666..1672), length: Encoded(Codec::UintRLE2, 1672..1678) } },
+            ColumnRef { schema: schema[41].clone(), present: Some(Encoded(Codec::BooleanRLE, 1690..1695)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1695..1708) } },
+            ColumnRef { schema: schema[42].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1708..1713) } },
+            ColumnRef { schema: schema[43].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1713..1718), length: Encoded(Codec::UintRLE2, 1718..1724) } },
+            ColumnRef { schema: schema[44].clone(), present: None, content: TS::Container { length: Encoded(Codec::UintRLE2, 1731..1736) } },
+            ColumnRef { schema: schema[45].clone(), present: None, content: TS::Blob { data: Encoded(Codec::BinaryEnc, 1736..1741), length: Encoded(Codec::UintRLE2, 1741..1747) } },
+            ColumnRef { schema: schema[46].clone(), present: Some(Encoded(Codec::BooleanRLE, 1755..1760)), content: TS::Int { data: Encoded(Codec::IntRLE2, 1760..1769) } }
         ]);
+    }
+
+    #[test]
+    fn test_byte_rle_decoder() {
+        let encoded_test = hex!("FC DEAD BEEF 03 00 FC CAFE BABE");
+        let dec: Vec<u8> = super::ByteRLEDecoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec, hex!("DEAD BEEF 00 00 00 00 00 00 CAFE BABE"));
     }
 }
