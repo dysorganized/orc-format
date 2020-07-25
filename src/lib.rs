@@ -544,20 +544,20 @@ impl Codec {
 /// or by a single byte (for runs)
 #[derive(Debug)]
 pub(crate) struct ByteRLEDecoder<'t> {
-    content: &'t [u8],
+    buf: &'t [u8],
     run: isize,
     run_item: u8,
     literal: isize
 }
 impl<'t> From<&'t[u8]> for ByteRLEDecoder<'t> {
-    fn from(content: &'t[u8]) -> Self {
-        ByteRLEDecoder {content, run:0, literal:0, run_item:0}
+    fn from(buf: &'t[u8]) -> Self {
+        ByteRLEDecoder {buf, run:0, literal:0, run_item:0}
     }
 }
 impl<'t> Iterator for ByteRLEDecoder<'t> {
     type Item = u8;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.content.is_empty() {
+        if self.buf.is_empty() {
             // Nothing left (even if it's the middle of a run or literal)
             None
         } else if self.run > 0 {
@@ -567,28 +567,63 @@ impl<'t> Iterator for ByteRLEDecoder<'t> {
         } else if self.literal > 0 {
             // Consume a byte
             self.literal -= 1;
-            let first = self.content[0];
-            self.content = &self.content[1..];
+            let first = self.buf[0];
+            self.buf = &self.buf[1..];
             Some(first)
-        } else if self.content.len() < 2 {
+        } else if self.buf.len() < 2 {
             // All other branches need two bytes
             None
         } else {
             // Start the next run
-            let flag = self.content[0] as i8;
+            let flag = self.buf[0] as i8;
             if flag < 0 {
                 self.literal = -(flag as isize);
-                self.content = &self.content[1..];
+                self.buf = &self.buf[1..];
             } else {
                 // The minimum run size is 3, so they hard coded that
                 self.run = 3 + (flag as isize);
-                self.run_item = self.content[1];
-                self.content = &self.content[2..];
+                self.run_item = self.buf[1];
+                self.buf = &self.buf[2..];
             }
             self.next()
         }
     }
 }
+
+/// Boolean encoder based on byte-level RLE
+#[derive(Debug)]
+pub(crate) struct BooleanRLEDecoder<'t> {
+    buf: ByteRLEDecoder<'t>,
+    bit: usize,
+    byte: u8
+}
+impl<'t> From<&'t[u8]> for BooleanRLEDecoder<'t> {
+    fn from(buf: &'t[u8]) -> Self {
+        BooleanRLEDecoder {
+            buf: ByteRLEDecoder::from(buf),
+            bit: 0,
+            byte: 0
+        }
+    }
+}
+impl<'t> Iterator for BooleanRLEDecoder<'t> {
+    type Item = bool;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bit == 0 {
+            // Try to advance to the next byte
+            match self.buf.next() {
+                None => return None,
+                Some(byte ) => {
+                    self.byte = byte;
+                    self.bit = 8;
+                }
+            }
+        }
+        self.bit -= 1;
+        Some((self.byte & (1 << self.bit)) != 0)
+    }
+}
+
 
 
 
@@ -735,5 +770,12 @@ mod tests {
         let encoded_test = hex!("FC DEAD BEEF 03 00 FC CAFE BABE");
         let dec: Vec<u8> = super::ByteRLEDecoder::from(&encoded_test[..]).collect();
         assert_eq!(dec, hex!("DEAD BEEF 00 00 00 00 00 00 CAFE BABE"));
+    }
+
+    #[test]
+    fn test_bool_rle_decoder() {
+        let encoded_test = hex!("FF 80");
+        let dec: Vec<bool> = super::BooleanRLEDecoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec, &[true, false, false, false, false, false, false, false]);
     }
 }
