@@ -5,7 +5,7 @@ pub enum OrcError {
     #[error("Malformed protobuf message; the data is probably corrupt.")]
     ProtobufError(#[from] prost::DecodeError),
     #[error("Truncated or empty message. Is the file empty or incomplete?")]
-    TruncatedError,
+    TruncatedError(&'static str),
     #[error("Invalid schema: {0}")]
     SchemaError(&'static str),
     #[error("Invalid encoding: {0}")]

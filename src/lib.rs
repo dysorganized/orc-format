@@ -85,7 +85,7 @@ impl<F: Read+Seek> ORCFile<F> {
         let file_len = file.seek(SeekFrom::End(0))?;
         let buffer_len = file_len.min(275);
         if buffer_len == 0 {
-            return Err(OrcError::TruncatedError)
+            return Err(OrcError::TruncatedError("Empty file"))
         }
         file.seek(SeekFrom::End(-(buffer_len as i64)))?;
         let mut buffer = vec![0u8; buffer_len as usize];
@@ -253,7 +253,7 @@ impl<'t> ORCFile<Cursor<&'t [u8]>> {
 /// read the whole footer to learn about the stripes.
 pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
     match byt.last() {
-        None => Err(OrcError::TruncatedError),
+        None => Err(OrcError::TruncatedError("ORC file is empty")),
         Some(&length) => {
             let postscript_bytes = &byt[
                 byt.len() - length as usize - 1 .. byt.len()-1];
@@ -480,8 +480,14 @@ pub enum ColumnSpec {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Encoded(Codec, std::ops::Range<u64>);
 
+#[derive(Debug)]
+pub enum PrimitiveStream<'t> {
+    Boolean(BooleanRLEDecoder<'t>),
+    Byte(ByteRLEDecoder<'t>)
+}
+
 /// Basic over the wire types, all primitives with a type-specific compression method
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum Codec {
     /// Boolean run length encoding
     BooleanRLE,
@@ -506,36 +512,13 @@ pub enum Codec {
 }
 
 impl Codec {
-    /// Decode a signed varint128 from a slice
-    ///
-    /// ORC uses the packed-varint128 structure protobuf2/3 uses
-    /// but it leaves out the tag prefix so it's not compatible. :/
-    /// So we use this shim to decode it instead.
-    ///
-    /// Returns the number and the remaining bytes.
-    pub fn read_i128(buf: &[u8]) -> OrcResult<(i128, &[u8])> {
-        let (value, rest) = Self::read_u128(buf)?;
-        // Inverse of (n << 1) ^ (n >> 127)
-        let zigzag = (value << 127 >> 127) ^ (value >> 1);
-        Ok((zigzag as i128, rest))
-    }
-
-    /// Decode an unsigned varint128 from a slice
-    ///
-    /// ORC uses the packed-varint128 structure protobuf2/3 uses
-    /// but it leaves out the tag prefix so it's not compatible. :/
-    /// So we use this shim to decode it instead.
-    ///
-    /// Returns the number and the remaining bytes.
-    pub fn read_u128(buf: &[u8]) -> OrcResult<(u128, &[u8])> {
-        let mut value = 0;
-        for i in 0..buf.len() {
-            value |= ((buf[i] & 0x7F) << (8*i)) as u128;
-            if buf[i] & 0x80 == 0 {
-                return Ok((value, &buf[i..]))
-            }
-        }
-        Err(OrcError::TruncatedError)
+    /// Initialize the appropriate decoder for this encoding
+    pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveStream<'t>> {
+        Ok(match self {
+            Codec::BooleanRLE => PrimitiveStream::Boolean(BooleanRLEDecoder::from(buf)),
+            Codec::ByteRLE => PrimitiveStream::Byte(ByteRLEDecoder::from(buf)),
+            _ => todo!("Codec not implemented")
+        })
     }
 }
 
@@ -543,7 +526,7 @@ impl Codec {
 /// It works pretty much like it sounds, a flag followed by a string (for literals),
 /// or by a single byte (for runs)
 #[derive(Debug)]
-pub(crate) struct ByteRLEDecoder<'t> {
+pub struct ByteRLEDecoder<'t> {
     buf: &'t [u8],
     run: isize,
     run_item: u8,
@@ -555,24 +538,31 @@ impl<'t> From<&'t[u8]> for ByteRLEDecoder<'t> {
     }
 }
 impl<'t> Iterator for ByteRLEDecoder<'t> {
-    type Item = u8;
+    type Item = OrcResult<u8>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.buf.is_empty() {
-            // Nothing left (even if it's the middle of a run or literal)
-            None
+            // Nothing left
+            if self.literal > 0 {
+                // That's not permitted inside a literal
+                Some(Err(OrcError::TruncatedError("ByteRLE literal cut short")))
+            } else {
+                None
+            }
         } else if self.run > 0 {
             // Repeat the last byte
             self.run -= 1;
-            Some(self.run_item)
+            Some(Ok(self.run_item))
         } else if self.literal > 0 {
             // Consume a byte
             self.literal -= 1;
             let first = self.buf[0];
             self.buf = &self.buf[1..];
-            Some(first)
-        } else if self.buf.len() < 2 {
-            // All other branches need two bytes
-            None
+            Some(Ok(first))
+        } else if self.buf.len() == 1 {
+            // If we have at least two bytes, we're ok.
+            // If we had zero bytes, we already handled that above.
+            // But if we have one byte, we must have ended on a control byte
+            Some(Err(OrcError::TruncatedError("Ended ByteRLE on a control byte")))
         } else {
             // Start the next run
             let flag = self.buf[0] as i8;
@@ -591,8 +581,11 @@ impl<'t> Iterator for ByteRLEDecoder<'t> {
 }
 
 /// Boolean encoder based on byte-level RLE
+///
+/// There is concerning ambiguity about the length of a boolean RLE.
+/// It's always padded to a multiple of 8, so you will likely get extra elements.
 #[derive(Debug)]
-pub(crate) struct BooleanRLEDecoder<'t> {
+pub struct BooleanRLEDecoder<'t> {
     buf: ByteRLEDecoder<'t>,
     bit: usize,
     byte: u8
@@ -607,29 +600,90 @@ impl<'t> From<&'t[u8]> for BooleanRLEDecoder<'t> {
     }
 }
 impl<'t> Iterator for BooleanRLEDecoder<'t> {
-    type Item = bool;
+    type Item = OrcResult<bool>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.bit == 0 {
             // Try to advance to the next byte
             match self.buf.next() {
                 None => return None,
-                Some(byte ) => {
+                Some(Err(x)) => return Some(Err(x)),
+                Some(Ok(byte)) => {
                     self.byte = byte;
                     self.bit = 8;
                 }
             }
         }
         self.bit -= 1;
-        Some((self.byte & (1 << self.bit)) != 0)
+        Some(Ok((self.byte & (1 << self.bit)) != 0))
+    }
+}
+#[derive(Debug)]
+pub struct Varint128Decoder<'t> {
+    buf: &'t [u8]
+}
+impl<'t> From<&'t[u8]> for Varint128Decoder<'t> {
+    fn from(buf: &'t[u8]) -> Self {
+        Varint128Decoder {buf}
+    }
+}
+impl<'t> Iterator for Varint128Decoder<'t> {
+    type Item = OrcResult<u128>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut value = 0;
+        for i in 0..self.buf.len() {
+            // Each consecutive byte reads from least to most significant in the value we're building
+            let byte = (self.buf[i] & 0x7F) as u128;
+            // Keep in mind the last byte will overflow the 128bit int by 5 bits
+            // because 7 * 18 = 126, and the MSB will still be taken out of the last byte, so that leaves 5 extra.
+            // The docs don't mention what happens with those bits. We're gambling that they are zeros
+            // but to be pedantic you could add a conditional to check the length. Hopefully that's not necessary.
+            value |= byte.wrapping_shl(7*i as u32);
+            if self.buf[i] & 0x80 == 0 {
+                // The most significant bit in each byte (0x80) indicates if the integer continues in the next byte
+                self.buf = &self.buf[i+1..];
+                return Some(Ok(value));
+            }
+        }
+        if self.buf.is_empty() {
+            None
+        } else {
+            // We must have run out of buffer and triggered for{} to stop but the MSB said there was still more.
+            Some(Err(OrcError::TruncatedError("Decoding varint128")))
+        }
     }
 }
 
-
+#[derive(Debug)]
+pub struct SignedVarint128Decoder<'t>(Varint128Decoder<'t>);
+impl<'t> From<&'t[u8]> for SignedVarint128Decoder<'t> {
+    fn from(buf: &'t[u8]) -> Self {
+        SignedVarint128Decoder(buf.into())
+    }
+}
+impl<'t> Iterator for SignedVarint128Decoder<'t> {
+    type Item = OrcResult<i128>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.0.next() {
+            None => None,
+            Some(Err(x)) => Some(Err(x)),
+            // Inverse of (n << 1) ^ (n >> 127)
+            // The left and right shift will clear all but one bit. There may be a better way.
+            Some(Ok(value)) => {
+                let value = value as i128;
+                let sign = value << 127 >> 127;
+                let abs = value >> 1;
+                Some(Ok(sign ^ abs))
+            },
+        }
+    }
+}
 
 
 #[cfg(test)]
 mod tests {
     use crate::messages;
+    use super::OrcResult;
+
     #[test]
     fn test_read_postscript() {
         let orc_bytes = include_bytes!("sample.orc");
@@ -768,14 +822,31 @@ mod tests {
     #[test]
     fn test_byte_rle_decoder() {
         let encoded_test = hex!("FC DEAD BEEF 03 00 FC CAFE BABE");
-        let dec: Vec<u8> = super::ByteRLEDecoder::from(&encoded_test[..]).collect();
-        assert_eq!(dec, hex!("DEAD BEEF 00 00 00 00 00 00 CAFE BABE"));
+        let dec: OrcResult<Vec<u8>> = super::ByteRLEDecoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec.unwrap(), hex!("DEAD BEEF 00 00 00 00 00 00 CAFE BABE"));
     }
 
     #[test]
     fn test_bool_rle_decoder() {
         let encoded_test = hex!("FF 80");
-        let dec: Vec<bool> = super::BooleanRLEDecoder::from(&encoded_test[..]).collect();
-        assert_eq!(dec, &[true, false, false, false, false, false, false, false]);
+        let dec: OrcResult<Vec<bool>> = super::BooleanRLEDecoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec.unwrap(), &[true, false, false, false, false, false, false, false]);
+    }
+
+    #[test]
+    fn test_varint128_decoder() {
+        let encoded_test = hex!("
+            96 01    96 01    00
+            FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 03");
+        let dec: OrcResult<Vec<u128>> = super::Varint128Decoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec.unwrap(), &[150, 150, 0, 340282366920938463463374607431768211455]);
+    }
+
+    #[test]
+    fn test_signed_varint128_decoder() {
+        let encoded_test = hex!("
+            96 01    96 01    00 01 02 03 04");
+        let dec: OrcResult<Vec<i128>> = super::SignedVarint128Decoder::from(&encoded_test[..]).collect();
+        assert_eq!(dec.unwrap(), &[75, 75, 0, -1, 1, -2, 2]);
     }
 }
