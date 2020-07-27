@@ -15,7 +15,9 @@ pub enum OrcError {
     #[error("IO Error")]
     IOError(#[from] std::io::Error),
     #[error("End of stream")]
-    EndOfStream
+    EndOfStream,
+    #[error("Bit sequence was too long for the target type. Are you reading a literal over 4GB on a 32bit machine?")]
+    LongBitstring
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;
