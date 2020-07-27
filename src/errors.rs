@@ -13,7 +13,9 @@ pub enum OrcError {
     #[error("No such stripe: {0}")]
     NoSuchStripe(usize),
     #[error("IO Error")]
-    IOError(#[from] std::io::Error)
+    IOError(#[from] std::io::Error),
+    #[error("End of stream")]
+    EndOfStream
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;
