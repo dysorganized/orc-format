@@ -1,6 +1,5 @@
-use num_traits::{Num, NumCast};
+use num_traits::{Num, NumCast, PrimInt};
 use std::marker::PhantomData;
-use std::convert::{TryFrom, TryInto};
 use super::errors::*;
 #[derive(Debug)]
 pub enum PrimitiveStream<'t> {
@@ -273,13 +272,12 @@ impl<'t, S: Sign> Decoder<'t> for RLE1<'t, S> {
 #[derive(Debug)]
 pub struct RLE2<'t, Inner> {
     nib: Nibble<'t>,
-    mode: RLE2Mode<Inner>,
+    mode: RLE2Mode<'t,Inner>,
     width: usize,
     length: usize,
-    remaining_bits: u32,
     ghost: std::marker::PhantomData<Inner>
 }
-pub trait Sign : Num + Copy + NumCast {
+pub trait Sign : Num + Copy + NumCast + PrimInt {
     fn unzigzag(value: u128) -> Self;
 }
 impl Sign for i128 {
@@ -297,15 +295,17 @@ impl Sign for u128 {
 }
 /// RLE2 switches between four modes of operation.
 /// The width and length are always necessary so they are in the encoder
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-enum RLE2Mode<Inner> {
+#[derive(Debug)]
+enum RLE2Mode<'t, Inner> {
     ShortRepeat(Inner),
     Direct,
     PatchedBase{
         base: Inner,
         patch_width: usize,
         patch_gap_width: usize,
-        patch_list_length: usize
+        remaining_patches: usize,
+        remaining_patch_gap: usize,
+        patch_buffer: Nibble<'t>
     },
     Delta {
         base: Inner,
@@ -321,18 +321,18 @@ impl<'t, S: Sign> From<&'t [u8]> for RLE2<'t, S> {
             mode: RLE2Mode::Direct,
             width: 0,
             length: 0,
-            remaining_bits: 8,
             ghost: std::marker::PhantomData
         }
     }
 }
 impl<'t, S: Sign> RLE2<'t, S> {
-    /// Read the two byte headers used in three of the four modes
-    fn two_byte_header(&mut self) -> OrcResult<()> {
+
+    /// Decode the bit widths as they are stored in 5 bits
+    fn decode_width(&mut self) -> OrcResult<usize> {
         // Convert encoded to decoded widths for certain modes
         // I have no idea why these are out of order
         #[rustfmt::skip]
-        let direct_widths = [
+        let bit_width_encoding = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
             // Inputs 22 and 23 are not valid but we'll continue the pattern
             22, 23,
@@ -341,21 +341,16 @@ impl<'t, S: Sign> RLE2<'t, S> {
             // The rest break it
             26, 28, 30, 32, 40, 48, 56, 64
         ];
-
-        // The first two bytes look like EEWWWWWL LLLLLLLL
-        // where E, W, L = encoding, width, length
-        let width_enc : usize = self.nib.read(5, "RLE2 header width")?;
-        self.width = direct_widths[width_enc];
-        self.length = self.nib.read(9, "RLE2 header length")?;
-        Ok(())
+        let width_before : usize = self.nib.read(5, "RLE2 header width")?;
+        Ok(bit_width_encoding[width_before])
     }
 
     /// Start a patch, choosing a mode for interpreting the upcoming string
-    fn get_mode(&mut self) -> OrcResult<RLE2Mode<S>> {
+    fn get_mode(&mut self) -> OrcResult<()> {
         if self.nib.buf.is_empty() {
             return Err(OrcError::EndOfStream);
         } else if self.length > 0 {
-            return Ok(self.mode);
+            return Ok(());
         }
         // The header can be 1, 2, or 4 bytes.
         // The most significant 2 bits of the first byte will tell you how long the header is.
@@ -371,7 +366,10 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 self.mode = RLE2Mode::ShortRepeat(elem);
             },
             1 => {
-                self.two_byte_header()?;
+                // The first two bytes look like EEWWWWWL LLLLLLLL
+                // where E, W, L = encoding, width, length
+                self.width = self.decode_width()?;
+                self.length = self.nib.read(9, "RLE2 header length")?;
                 self.mode = RLE2Mode::Direct;
             },
             2 => {
@@ -383,13 +381,14 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // and N = patch list length
 
                 // Width and Length are the same as the direct encoding, in bits.
-                self.two_byte_header()?;
+                self.width = self.decode_width()?;
+                self.length = self.nib.read(9, "RLE2 header length")?;
 
                 // The rest are extra parameters not found in the other modes
                 let base_width = self.nib.read::<usize>(3, "RLE2 patched base: base width")? + 1;
-                let patch_width = self.nib.read::<usize>(5, "RLE2 patched base: patch width")? + 1;
+                let patch_width = self.decode_width()?;
                 let patch_gap_width = self.nib.read::<usize>(3, "RLE2 patched base: patch gap width")? + 1;
-                let patch_list_length = self.nib.read(5, "RLE2 patched base: patch list length")?; // can be 0
+                let remaining_patches = self.nib.read(5, "RLE2 patched base: patch list length")?; // can be 0
 
                 // NOTE: The spec seems ambiguous here:
                 // > The base value is stored as a big endian value with negative values marked by the most
@@ -397,18 +396,28 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // It's not clear if this applies to unsigned numbers or if zigzag is not used for these
                 // TODO: get more examples of this
                 //let negate = self.nib.read(1, "RLE2 negate bit")?;
-                let base: u128 = self.nib.read(base_width * 8, "RLE patched base: base")?;
+                let base: u128 = self.nib.read(base_width * 8, "RLE3 patched base: base")?;
 
+                let mut patch_buffer = Nibble {
+                    buf: self.nib.remainder(),
+                    start: (self.width * self.length) / 8 * 8
+                };
 
                 self.mode = RLE2Mode::PatchedBase{
                     base: S::unzigzag(base),
                     patch_width,
                     patch_gap_width,
-                    patch_list_length
+                    remaining_patches,
+                    remaining_patch_gap: patch_buffer.read(patch_gap_width, "RLE2 initial patch gap")?,
+                    patch_buffer 
                 };
             },
             3 => {
-                self.two_byte_header()?;
+                // The first two bytes look like EEWWWWWL LLLLLLLL
+                // where E, W, L = encoding, width, length
+                self.width = self.decode_width()?;
+                self.length = self.nib.read(9, "RLE2 header length")?;
+
                 // The base and delta count against the length? Not sure why.
                 self.length -= 2;
                 // These have to be different decoders because the output types are different.
@@ -418,7 +427,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
             },
             _ => unreachable!() 
         }
-        Ok(self.mode)
+        Ok(())
     }
 }
 /// Most of the RLE implementations look similar. Look at the ByteRLE for the clearest example
@@ -428,13 +437,37 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         self.nib.remainder()
     }
     fn next_result(&mut self) -> OrcResult<Self::Output> {
-        // match self.get_mode() {
-        //     RLE2Mode::ShortRepeat(item) => {
-        //         self.length -= 1;
-        //         Ok(item) 
-        //     }
-        // }
-        todo!()
+        self.get_mode()?;
+        match self.mode {
+            RLE2Mode::ShortRepeat(item) => {
+                self.length -= 1;
+                Ok(item) 
+            }
+            RLE2Mode::Direct => {
+                self.length -= 1;
+                self.nib.read(self.width, "RLE2 direct encoded int")
+            }
+            RLE2Mode::PatchedBase{
+                base,
+                patch_width,
+                patch_gap_width,
+                ref mut remaining_patches,
+                ref mut remaining_patch_gap,
+                ref mut patch_buffer
+            } => {
+                let mut value = base;
+                value = value + self.nib.read(self.width, "RLE2 patched base delta")?;
+                if *remaining_patch_gap == 0 && *remaining_patches > 0 {
+                    value = value | (patch_buffer.read::<S>(patch_width, "RLE2 patched base: patch")? << self.width);
+                    *remaining_patches -= 1;
+                    if *remaining_patches > 0 {
+                        *remaining_patch_gap = patch_buffer.read(patch_gap_width, "RLE2 patched base: patch gap")?;
+                    }
+                }
+                Ok(value)
+            }
+            _ => todo!()
+        }
     }
 }
 
