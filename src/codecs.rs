@@ -308,8 +308,10 @@ enum RLE2Mode<'t, Inner> {
         patch_buffer: Nibble<'t>
     },
     Delta {
-        base: Inner,
-        delta: i128
+        // See comments in get_mode on why base is i128
+        base: i128,
+        consumed_first_delta: bool,
+        first_delta: i128
     }
 }
 decoder_iter!(RLE2<'t, u128>, u128);
@@ -400,7 +402,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
 
                 let mut patch_buffer = Nibble {
                     buf: self.nib.remainder(),
-                    start: (self.width * self.length) / 8 * 8
+                    start: ((self.width * self.length) + 7) / 8
                 };
 
                 self.mode = RLE2Mode::PatchedBase{
@@ -416,14 +418,22 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
                 // where E, W, L = encoding, width, length
                 self.width = self.decode_width()?;
-                self.length = self.nib.read(9, "RLE2 header length")?;
+                self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 2;
 
-                // The base and delta count against the length? Not sure why.
-                self.length -= 2;
-                // These have to be different decoders because the output types are different.
-                let base = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
-                let delta = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
-                self.mode = RLE2Mode::Delta {base, delta}
+                // Deltas aren't valid for a sequence of less than two items, so the length starts at two.
+                // Note here that base can be signed or unsigned (so we need the conditional unzigzag)
+                // but the delta is always signed.
+                // So even though we may choose to unzigzag base or not, we will still store it as i128,
+                // so that we can apply the deltas.
+                // Then we will do a no-op conversion later to get either u128 or i128 as necessary.
+                let base: S = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
+                let first_delta = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
+                self.mode = RLE2Mode::Delta {
+                    // Everything should fit in an i128
+                    base: NumCast::from(base).unwrap(),
+                    first_delta,
+                    consumed_first_delta: false
+                }
             },
             _ => unreachable!() 
         }
@@ -466,7 +476,15 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
                 }
                 Ok(value)
             }
-            _ => todo!()
+            RLE2Mode::Delta{base, first_delta, ref mut consumed_first_delta} => {
+                let value = if *consumed_first_delta {
+                    base + first_delta.signum() * self.nib.read::<i128>(self.width, "RLE2 delta: delta")?
+                } else {
+                    *consumed_first_delta = true;
+                    base + first_delta
+                };
+                NumCast::from(value).ok_or(OrcError::LongBitstring)
+            }
         }
     }
 }
@@ -488,7 +506,7 @@ impl<'t> Nibble<'t> {
     /// This updates the bit_offset, which may matter to you for continuing 
     fn read<T: NumCast>(&mut self, mut read_len: usize, context: &'static str) -> OrcResult<T> {
         let mut value: u64 = 0;
-        if self.buf.len() < read_len / 8 {
+        if self.buf.len() < (self.start + read_len) / 8 {
             return Err(OrcError::TruncatedError(context))
         }
         
