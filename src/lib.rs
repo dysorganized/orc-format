@@ -486,7 +486,6 @@ pub struct Encoded(Codec, std::ops::Range<u64>);
 #[cfg(test)]
 mod tests {
     use crate::messages;
-    use super::OrcResult;
 
     #[test]
     fn test_read_postscript() {

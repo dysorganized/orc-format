@@ -310,8 +310,8 @@ enum RLE2Mode<'t, Inner> {
     Delta {
         // See comments in get_mode on why base is i128
         base: i128,
-        consumed_first_delta: bool,
-        first_delta: i128
+        first_delta: i128,
+        consumed: usize
     }
 }
 decoder_iter!(RLE2<'t, u128>, u128);
@@ -349,10 +349,8 @@ impl<'t, S: Sign> RLE2<'t, S> {
 
     /// Start a patch, choosing a mode for interpreting the upcoming string
     fn get_mode(&mut self) -> OrcResult<()> {
-        if self.nib.buf.is_empty() {
+        if self.nib.is_end() {
             return Err(OrcError::EndOfStream);
-        } else if self.length > 0 {
-            return Ok(());
         }
         // The header can be 1, 2, or 4 bytes.
         // The most significant 2 bits of the first byte will tell you how long the header is.
@@ -363,7 +361,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // where E, W, L = encoding, width, length
                 self.width = self.nib.read::<usize>(3, "RLE2 short read width")? + 1;
                 self.length = self.nib.read::<usize>(3, "RLE2 short repeat length")? + 3;
-                let elem = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
+                let elem = self.nib.read(self.width*8, "RLE2 short repeat element")?;
                 
                 self.mode = RLE2Mode::ShortRepeat(elem);
             },
@@ -371,7 +369,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
                 // where E, W, L = encoding, width, length
                 self.width = self.decode_width()?;
-                self.length = self.nib.read(9, "RLE2 header length")?;
+                self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 1;
                 self.mode = RLE2Mode::Direct;
             },
             2 => {
@@ -384,7 +382,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
 
                 // Width and Length are the same as the direct encoding, in bits.
                 self.width = self.decode_width()?;
-                self.length = self.nib.read(9, "RLE2 header length")?;
+                self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 1;
 
                 // The rest are extra parameters not found in the other modes
                 let base_width = self.nib.read::<usize>(3, "RLE2 patched base: base width")? + 1;
@@ -401,16 +399,17 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 let base: u128 = self.nib.read(base_width * 8, "RLE3 patched base: base")?;
 
                 let mut patch_buffer = Nibble {
-                    buf: self.nib.remainder(),
-                    start: ((self.width * self.length) + 7) / 8
+                    buf: self.nib.buf,
+                    start: (self.nib.start + (self.width * self.length)) + 7 / 8
                 };
+                let remaining_patch_gap = patch_buffer.read(patch_gap_width, "RLE2 initial patch gap")?;
 
                 self.mode = RLE2Mode::PatchedBase{
                     base: S::unzigzag(base),
                     patch_width,
                     patch_gap_width,
                     remaining_patches,
-                    remaining_patch_gap: patch_buffer.read(patch_gap_width, "RLE2 initial patch gap")?,
+                    remaining_patch_gap,
                     patch_buffer 
                 };
             },
@@ -418,7 +417,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
                 // where E, W, L = encoding, width, length
                 self.width = self.decode_width()?;
-                self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 2;
+                self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 1;
 
                 // Deltas aren't valid for a sequence of less than two items, so the length starts at two.
                 // Note here that base can be signed or unsigned (so we need the conditional unzigzag)
@@ -426,13 +425,15 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // So even though we may choose to unzigzag base or not, we will still store it as i128,
                 // so that we can apply the deltas.
                 // Then we will do a no-op conversion later to get either u128 or i128 as necessary.
+                //
+                // Unlike the other modes of RLE2 these are legit varints with MSB flags like protobuf uses
                 let base: S = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
                 let first_delta = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
                 self.mode = RLE2Mode::Delta {
                     // Everything should fit in an i128
                     base: NumCast::from(base).unwrap(),
                     first_delta,
-                    consumed_first_delta: false
+                    consumed: 0
                 }
             },
             _ => unreachable!() 
@@ -447,14 +448,15 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         self.nib.remainder()
     }
     fn next_result(&mut self) -> OrcResult<Self::Output> {
-        self.get_mode()?;
+        if self.length == 0 {
+            self.get_mode()?;
+        }
+        self.length = self.length.saturating_sub(1);
         match self.mode {
             RLE2Mode::ShortRepeat(item) => {
-                self.length -= 1;
                 Ok(item) 
             }
             RLE2Mode::Direct => {
-                self.length -= 1;
                 self.nib.read(self.width, "RLE2 direct encoded int")
             }
             RLE2Mode::PatchedBase{
@@ -468,22 +470,31 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
                 let mut value = base;
                 value = value + self.nib.read(self.width, "RLE2 patched base delta")?;
                 if *remaining_patch_gap == 0 && *remaining_patches > 0 {
-                    value = value | (patch_buffer.read::<S>(patch_width, "RLE2 patched base: patch")? << self.width);
+                    // The patch (if present) must be applied before the addition
+                    value = value + (patch_buffer.read::<S>(patch_width, "RLE2 patched base: patch")? << self.width);
                     *remaining_patches -= 1;
                     if *remaining_patches > 0 {
                         *remaining_patch_gap = patch_buffer.read(patch_gap_width, "RLE2 patched base: patch gap")?;
                     }
                 }
+                *remaining_patch_gap = remaining_patch_gap.saturating_sub(1);
+                // We need the main nibble to catch up to the patch nibble when the patched base mode is done
+                if self.length == 0 {
+                    std::mem::swap(&mut self.nib,  patch_buffer);
+                    self.nib.round_up();
+                }
                 Ok(value)
             }
-            RLE2Mode::Delta{base, first_delta, ref mut consumed_first_delta} => {
-                let value = if *consumed_first_delta {
-                    base + first_delta.signum() * self.nib.read::<i128>(self.width, "RLE2 delta: delta")?
-                } else {
-                    *consumed_first_delta = true;
-                    base + first_delta
+            RLE2Mode::Delta{ref mut base, first_delta, ref mut consumed} => {
+                match *consumed {
+                    0 => (),
+                    1 => *base += first_delta, 
+                    _ => *base +=
+                        first_delta.signum()
+                        * self.nib.read::<i128>(self.width, "RLE2 delta: delta")?
                 };
-                NumCast::from(value).ok_or(OrcError::LongBitstring)
+                *consumed += 1;
+                NumCast::from(*base).ok_or(OrcError::LongBitstring)
             }
         }
     }
@@ -496,6 +507,16 @@ struct Nibble<'t> {
     start: usize
 }
 impl<'t> Nibble<'t> {
+    /// Is there any more to eat?
+    fn is_end(&self) -> bool {
+        self.start / 8 >= self.buf.len()
+    }
+    
+    /// Round the nibble cursor to the next byte
+    fn round_up(&mut self) {
+        self.start = (self.start + 7) & !7;
+    }
+
     /// Return the unconsumed portion of the buffer, starting at the next unread byte
     fn remainder(&self) -> &'t [u8] {
         &self.buf[(self.start + 7) >> 3 ..]
@@ -603,11 +624,6 @@ mod tests {
             2030, 2000, 2020, 1000000, 2040, 2050, 2060, 2070, 2080, 2090, 2100, 2110, 2120, 2130, 2140, 2150, 2160, 2170, 2180, 2190,
             2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
         ]);
-
-        // The run and patch types don't make any difference to the zigzag code so just test the easy one
-        let encoded_test : RLE2<i128> = hex!("0a 27 10")[..].into();
-        let dec: OrcResult<Vec<i128>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[-5000, -5000, -5000, -5000, -5000]);
     }
 
     #[test]
