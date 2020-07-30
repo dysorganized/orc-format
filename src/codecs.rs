@@ -4,7 +4,11 @@ use super::errors::*;
 #[derive(Debug)]
 pub enum PrimitiveStream<'t> {
     Boolean(BooleanRLEDecoder<'t>),
-    Byte(ByteRLEDecoder<'t>)
+    Byte(ByteRLEDecoder<'t>),
+    UintRLE1(RLE1<'t, u128>),
+    IntRLE1(RLE1<'t, i128>),
+    UintRLE2(RLE2<'t, u128>),
+    IntRLE2(RLE2<'t, i128>)
 }
 
 /// Basic over the wire types, all primitives with a type-specific compression method
@@ -35,11 +39,71 @@ pub enum Codec {
 impl Codec {
     /// Initialize the appropriate decoder for this encoding
     pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveStream<'t>> {
+        use PrimitiveStream as PS;
         Ok(match self {
-            Codec::BooleanRLE => PrimitiveStream::Boolean(BooleanRLEDecoder::from(buf)),
-            Codec::ByteRLE => PrimitiveStream::Byte(ByteRLEDecoder::from(buf)),
+            Codec::BooleanRLE => PS::Boolean(buf.into()),
+            Codec::ByteRLE => PS::Byte(buf.into()),
+            Codec::UintRLE1 => PS::UintRLE1(buf.into()),
+            Codec::IntRLE1 => PS::IntRLE1(buf.into()),
+            Codec::UintRLE2 => PS::UintRLE2(buf.into()),
+            Codec::IntRLE2 => PS::IntRLE2(buf.into()),
             _ => todo!("Codec not implemented")
         })
+    }
+}
+
+
+/// Read a byte buffer bits at a time, keeping a bit-level cursor
+#[derive(Debug)]
+struct Nibble<'t> {
+    buf: &'t [u8],
+    start: usize
+}
+impl<'t> Nibble<'t> {
+    /// Is there any more to eat?
+    fn is_end(&self) -> bool {
+        self.start / 8 >= self.buf.len()
+    }
+    
+    /// Round the nibble cursor to the next byte
+    fn round_up(&mut self) {
+        self.start = (self.start + 7) & !7;
+    }
+
+    /// Return the unconsumed portion of the buffer, starting at the next unread byte
+    fn remainder(&self) -> &'t [u8] {
+        &self.buf[(self.start + 7) >> 3 ..]
+    }
+
+    /// Read the next few bits as an unsigned integer
+    ///
+    /// This updates the bit_offset, which may matter to you for continuing 
+    fn read<T: NumCast>(&mut self, mut read_len: usize, context: &'static str) -> OrcResult<T> {
+        let mut value: u64 = 0;
+        if self.buf.len() < (self.start + read_len) / 8 {
+            return Err(OrcError::TruncatedError(context))
+        }
+        
+        while read_len > 0 {
+            let (byte_index, bit_index) = (self.start >> 3, self.start & 7);
+            let next_bits = read_len.min(8-bit_index);
+            let byte = self.buf[byte_index] << bit_index >> (8 - next_bits);
+            value <<= next_bits;
+            value |= byte as u64;
+            read_len -= next_bits;
+            self.start += next_bits;
+        }
+        T::from(value).ok_or(OrcError::LongBitstring)
+    }
+
+    /// Run a byte level parser, like Varintdecoder, while keeping the Nibble intact
+    /// This rounds up the bit reading to the next byte, and assumes the parser consumes whole bytes.
+    fn byte_level_interlude<F, X>(&mut self, mut func: F) -> OrcResult<X>
+        where F: FnMut(&'t [u8]) -> OrcResult<(X, &'t [u8])> {
+        let (x, rest) = func(self.remainder())?;
+        self.buf = rest;
+        self.start = 0;
+        Ok(x)
     }
 }
 
@@ -497,60 +561,6 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
                 NumCast::from(*base).ok_or(OrcError::LongBitstring)
             }
         }
-    }
-}
-
-/// Read a byte buffer bits at a time
-#[derive(Debug)]
-struct Nibble<'t> {
-    buf: &'t [u8],
-    start: usize
-}
-impl<'t> Nibble<'t> {
-    /// Is there any more to eat?
-    fn is_end(&self) -> bool {
-        self.start / 8 >= self.buf.len()
-    }
-    
-    /// Round the nibble cursor to the next byte
-    fn round_up(&mut self) {
-        self.start = (self.start + 7) & !7;
-    }
-
-    /// Return the unconsumed portion of the buffer, starting at the next unread byte
-    fn remainder(&self) -> &'t [u8] {
-        &self.buf[(self.start + 7) >> 3 ..]
-    }
-
-    /// Read the next few bits as an unsigned integer
-    ///
-    /// This updates the bit_offset, which may matter to you for continuing 
-    fn read<T: NumCast>(&mut self, mut read_len: usize, context: &'static str) -> OrcResult<T> {
-        let mut value: u64 = 0;
-        if self.buf.len() < (self.start + read_len) / 8 {
-            return Err(OrcError::TruncatedError(context))
-        }
-        
-        while read_len > 0 {
-            let (byte_index, bit_index) = (self.start >> 3, self.start & 7);
-            let next_bits = read_len.min(8-bit_index);
-            let byte = self.buf[byte_index] << bit_index >> (8 - next_bits);
-            value <<= next_bits;
-            value |= byte as u64;
-            read_len -= next_bits;
-            self.start += next_bits;
-        }
-        T::from(value).ok_or(OrcError::LongBitstring)
-    }
-
-    /// Run a byte level parser, like Varintdecoder, while keeping the Nibble intact
-    /// This rounds up the bit reading to the next byte, and assumes the parser consumes whole bytes.
-    fn byte_level_interlude<F, X>(&mut self, mut func: F) -> OrcResult<X>
-        where F: FnMut(&'t [u8]) -> OrcResult<(X, &'t [u8])> {
-        let (x, rest) = func(self.remainder())?;
-        self.buf = rest;
-        self.start = 0;
-        Ok(x)
     }
 }
 
