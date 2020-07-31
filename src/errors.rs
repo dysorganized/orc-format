@@ -8,6 +8,10 @@ pub enum OrcError {
     TruncatedError,
     #[error("Invalid schema: {0}")]
     SchemaError(&'static str),
+    #[error("Invalid encoding: {0}")]
+    EncodingError(String),
+    #[error("No such stripe: {0}")]
+    NoSuchStripe(usize),
     #[error("IO Error")]
     IOError(#[from] std::io::Error)
 }
