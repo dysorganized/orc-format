@@ -1,6 +1,25 @@
 use num_traits::{Num, NumCast, PrimInt};
 use std::marker::PhantomData;
 use super::errors::*;
+
+/// Helper trait allowing RLE1/2 to work for both signed and unsigned
+pub trait Sign : Num + Copy + NumCast + PrimInt + std::fmt::Debug {
+    fn unzigzag(value: u128) -> Self;
+}
+impl Sign for i128 {
+    // Undo zigzag encoding
+    fn unzigzag(value: u128) -> Self {
+        let value = value as i128;
+        (value << 127 >> 127) ^ (value >> 1)
+    }
+}
+impl Sign for u128 {
+    // Don't do anything
+    fn unzigzag(value: u128) -> Self {
+        value
+    }
+}
+
 #[derive(Debug)]
 pub enum PrimitiveStream<'t> {
     Boolean(BooleanRLEDecoder<'t>),
@@ -53,6 +72,8 @@ impl Codec {
 }
 
 
+
+
 /// Read a byte buffer bits at a time, keeping a bit-level cursor
 #[derive(Debug)]
 struct Nibble<'t> {
@@ -87,7 +108,8 @@ impl<'t> Nibble<'t> {
         while read_len > 0 {
             let (byte_index, bit_index) = (self.start >> 3, self.start & 7);
             let next_bits = read_len.min(8-bit_index);
-            let byte = self.buf[byte_index] << bit_index >> (8 - next_bits);
+            let byte = self.buf.get(byte_index).ok_or(OrcError::TruncatedError(context))?
+                << bit_index >> (8 - next_bits);
             value <<= next_bits;
             value |= byte as u64;
             read_len -= next_bits;
@@ -107,7 +129,7 @@ impl<'t> Nibble<'t> {
     }
 }
 
-pub trait Decoder<'t> {
+pub trait Decoder<'t> : std::fmt::Debug {
     type Output;
     fn remainder(&self) -> &'t [u8];
     fn next_result(&mut self) -> OrcResult<Self::Output>;
@@ -341,22 +363,7 @@ pub struct RLE2<'t, Inner> {
     length: usize,
     ghost: std::marker::PhantomData<Inner>
 }
-pub trait Sign : Num + Copy + NumCast + PrimInt {
-    fn unzigzag(value: u128) -> Self;
-}
-impl Sign for i128 {
-    // Undo zigzag encoding
-    fn unzigzag(value: u128) -> Self {
-        let value = value as i128;
-        (value << 127 >> 127) ^ (value >> 1)
-    }
-}
-impl Sign for u128 {
-    // Don't do anything
-    fn unzigzag(value: u128) -> Self {
-        value
-    }
-}
+
 /// RLE2 switches between four modes of operation.
 /// The width and length are always necessary so they are in the encoder
 #[derive(Debug)]
@@ -460,7 +467,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // It's not clear if this applies to unsigned numbers or if zigzag is not used for these
                 // TODO: get more examples of this
                 //let negate = self.nib.read(1, "RLE2 negate bit")?;
-                let base: u128 = self.nib.read(base_width * 8, "RLE3 patched base: base")?;
+                let base: u128 = self.nib.read(base_width * 8, "RLE2 patched base: base")?;
 
                 let mut patch_buffer = Nibble {
                     buf: self.nib.buf,
