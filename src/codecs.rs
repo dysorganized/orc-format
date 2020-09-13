@@ -1,14 +1,34 @@
 use num_traits::{Num, NumCast, PrimInt};
 use std::marker::PhantomData;
 use super::errors::*;
+use crate::nibble::Nibble;
+
+/// Helper trait allowing RLE1/2 to work for both signed and unsigned
+pub trait Sign : Num + Copy + NumCast + PrimInt + std::fmt::Debug {
+    fn unzigzag(value: u128) -> Self;
+}
+impl Sign for i128 {
+    // Undo zigzag encoding
+    fn unzigzag(value: u128) -> Self {
+        let value = value as i128;
+        (value << 127 >> 127) ^ (value >> 1)
+    }
+}
+impl Sign for u128 {
+    // Don't do anything
+    fn unzigzag(value: u128) -> Self {
+        value
+    }
+}
+
 #[derive(Debug)]
-pub enum PrimitiveStream<'t> {
-    Boolean(BooleanRLEDecoder<'t>),
-    Byte(ByteRLEDecoder<'t>),
-    UintRLE1(RLE1<'t, u128>),
-    IntRLE1(RLE1<'t, i128>),
-    UintRLE2(RLE2<'t, u128>),
-    IntRLE2(RLE2<'t, i128>)
+pub enum PrimitiveBuffer {
+    Boolean(Vec<bool>),
+    Byte(Vec<u8>),
+    Uint128(Vec<u128>),
+    Int128(Vec<i128>),
+    Float(Vec<f64>),
+    Binary(Vec<u8>)
 }
 
 /// Basic over the wire types, all primitives with a type-specific compression method
@@ -38,76 +58,21 @@ pub enum Codec {
 
 impl Codec {
     /// Initialize the appropriate decoder for this encoding
-    pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveStream<'t>> {
-        use PrimitiveStream as PS;
+    pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveBuffer> {
+        use PrimitiveBuffer as PB;
         Ok(match self {
-            Codec::BooleanRLE => PS::Boolean(buf.into()),
-            Codec::ByteRLE => PS::Byte(buf.into()),
-            Codec::UintRLE1 => PS::UintRLE1(buf.into()),
-            Codec::IntRLE1 => PS::IntRLE1(buf.into()),
-            Codec::UintRLE2 => PS::UintRLE2(buf.into()),
-            Codec::IntRLE2 => PS::IntRLE2(buf.into()),
+            Codec::BooleanRLE => PB::Boolean(BooleanRLEDecoder::from(buf).collect::<OrcResult<_>>()?),
+            Codec::ByteRLE => PB::Byte(ByteRLEDecoder::from(buf).collect::<OrcResult<_>>()?),
+            Codec::UintRLE1 => PB::Uint128(RLE1::<u128>::from(buf).collect::<OrcResult<_>>()?),
+            Codec::IntRLE1 => PB::Int128(RLE1::<i128>::from(buf).collect::<OrcResult<_>>()?),
+            Codec::UintRLE2 => PB::Uint128(RLE2::<u128>::from(buf).collect::<OrcResult<_>>()?),
+            Codec::IntRLE2 => PB::Int128(RLE2::<i128>::from(buf).collect::<OrcResult<_>>()?),
             _ => todo!("Codec not implemented")
         })
     }
 }
 
-
-/// Read a byte buffer bits at a time, keeping a bit-level cursor
-#[derive(Debug)]
-struct Nibble<'t> {
-    buf: &'t [u8],
-    start: usize
-}
-impl<'t> Nibble<'t> {
-    /// Is there any more to eat?
-    fn is_end(&self) -> bool {
-        self.start / 8 >= self.buf.len()
-    }
-    
-    /// Round the nibble cursor to the next byte
-    fn round_up(&mut self) {
-        self.start = (self.start + 7) & !7;
-    }
-
-    /// Return the unconsumed portion of the buffer, starting at the next unread byte
-    fn remainder(&self) -> &'t [u8] {
-        &self.buf[(self.start + 7) >> 3 ..]
-    }
-
-    /// Read the next few bits as an unsigned integer
-    ///
-    /// This updates the bit_offset, which may matter to you for continuing 
-    fn read<T: NumCast>(&mut self, mut read_len: usize, context: &'static str) -> OrcResult<T> {
-        let mut value: u64 = 0;
-        if self.buf.len() < (self.start + read_len) / 8 {
-            return Err(OrcError::TruncatedError(context))
-        }
-        
-        while read_len > 0 {
-            let (byte_index, bit_index) = (self.start >> 3, self.start & 7);
-            let next_bits = read_len.min(8-bit_index);
-            let byte = self.buf[byte_index] << bit_index >> (8 - next_bits);
-            value <<= next_bits;
-            value |= byte as u64;
-            read_len -= next_bits;
-            self.start += next_bits;
-        }
-        T::from(value).ok_or(OrcError::LongBitstring)
-    }
-
-    /// Run a byte level parser, like Varintdecoder, while keeping the Nibble intact
-    /// This rounds up the bit reading to the next byte, and assumes the parser consumes whole bytes.
-    fn byte_level_interlude<F, X>(&mut self, mut func: F) -> OrcResult<X>
-        where F: FnMut(&'t [u8]) -> OrcResult<(X, &'t [u8])> {
-        let (x, rest) = func(self.remainder())?;
-        self.buf = rest;
-        self.start = 0;
-        Ok(x)
-    }
-}
-
-pub trait Decoder<'t> {
+pub trait Decoder<'t> : std::fmt::Debug {
     type Output;
     fn remainder(&self) -> &'t [u8];
     fn next_result(&mut self) -> OrcResult<Self::Output>;
@@ -341,22 +306,7 @@ pub struct RLE2<'t, Inner> {
     length: usize,
     ghost: std::marker::PhantomData<Inner>
 }
-pub trait Sign : Num + Copy + NumCast + PrimInt {
-    fn unzigzag(value: u128) -> Self;
-}
-impl Sign for i128 {
-    // Undo zigzag encoding
-    fn unzigzag(value: u128) -> Self {
-        let value = value as i128;
-        (value << 127 >> 127) ^ (value >> 1)
-    }
-}
-impl Sign for u128 {
-    // Don't do anything
-    fn unzigzag(value: u128) -> Self {
-        value
-    }
-}
+
 /// RLE2 switches between four modes of operation.
 /// The width and length are always necessary so they are in the encoder
 #[derive(Debug)]
@@ -460,7 +410,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // It's not clear if this applies to unsigned numbers or if zigzag is not used for these
                 // TODO: get more examples of this
                 //let negate = self.nib.read(1, "RLE2 negate bit")?;
-                let base: u128 = self.nib.read(base_width * 8, "RLE3 patched base: base")?;
+                let base: u128 = self.nib.read(base_width * 8, "RLE2 patched base: base")?;
 
                 let mut patch_buffer = Nibble {
                     buf: self.nib.buf,
@@ -561,92 +511,5 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
                 NumCast::from(*base).ok_or(OrcError::LongBitstring)
             }
         }
-    }
-}
-
-
-#[cfg(test)]
-mod tests {
-    use crate::errors::*;
-    use super::*;
-
-    #[test]
-    fn test_byte_rle_decoder() {
-        let encoded_test: ByteRLEDecoder = hex!("FC DEAD BEEF 03 00 FC CAFE BABE")[..].into();
-        let dec: OrcResult<Vec<u8>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), hex!("DEAD BEEF 00 00 00 00 00 00 CAFE BABE"));
-    }
-
-    #[test]
-    fn test_bool_rle_decoder() {
-        let encoded_test : BooleanRLEDecoder = hex!("FF 80")[..].into();
-        let dec: OrcResult<Vec<bool>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[true, false, false, false, false, false, false, false]);
-    }
-
-    #[test]
-    fn test_varint128_decoder() {
-        let encoded_test : VarDecoder<u128> = hex!("
-            96 01    96 01    00
-            FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 03")[..].into();
-        let dec: OrcResult<Vec<u128>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[150, 150, 0, 340282366920938463463374607431768211455]);
-    }
-
-    #[test]
-    fn test_signed_varint128_decoder() {
-        let encoded_test : VarDecoder<i128> = hex!("
-            96 01    96 01    00 01 02 03 04")[..].into();
-        let dec: OrcResult<Vec<i128>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[75, 75, 0, -1, 1, -2, 2]);
-    }
-
-    #[test]
-    fn test_intrle1_decoder() {
-        let encoded_test : RLE1<u128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
-        let dec: OrcResult<Vec<u128>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[7,7,7,7,7,7,2,3,4,7,11]);
-
-        let encoded_test : RLE1<i128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
-        let dec: OrcResult<Vec<i128>> = encoded_test.collect();
-        assert_eq!(dec.unwrap(), &[-4,-4,-4,-4,-4,-4,1,-2,2,-4,-6]);
-    }
-
-    #[test]
-    fn test_intrle2_decoder() {
-        // First a short repeat.
-        // Then direct
-        // Then a patched base
-        // and last a delta.
-        // All of these examples from from the specification.
-        #[rustfmt::skip]
-        let encoded_test : RLE2<u128> = hex!("
-            0a 27 10
-            5e 03 5c a1 ab 1e dead beef
-            8e 13 2b 21 07 d0 1e 00 14 70 28 32 3c 46 50 5a 64 6e 78 82 8c 96 a0 aa b4 be fc e8
-            c6 09 02 02 22 42 42 46
-        ")[..].into();
-        let dec: OrcResult<Vec<u128>> = encoded_test.collect();
-        #[rustfmt::skip]
-        assert_eq!(dec.unwrap(), vec![
-            10000, 10000, 10000, 10000, 10000,
-            23713, 43806, 57005, 48879,
-            2030, 2000, 2020, 1000000, 2040, 2050, 2060, 2070, 2080, 2090, 2100, 2110, 2120, 2130, 2140, 2150, 2160, 2170, 2180, 2190,
-            2, 3, 5, 7, 11, 13, 17, 19, 23, 29,
-        ]);
-    }
-
-    #[test]
-    fn test_nibble() {
-        let mut nib = Nibble{
-            buf: &hex!("01 23 45 67 89 AB CD EF")[..],
-            start: 0
-        };
-        assert_eq!(nib.read::<u64>(4, "").unwrap(), 0x0);
-        assert_eq!(nib.read::<u64>(8, "").unwrap(), 0x12);
-        assert_eq!(nib.read::<u64>(12, "").unwrap(), 0x345);
-        assert_eq!(nib.read::<u64>(1, "").unwrap(), 0);
-        assert_eq!(nib.read::<u64>(7, "").unwrap(), 0x67);
-        assert_eq!(nib.read::<u64>(5, "").unwrap(), 0x11);
     }
 }
