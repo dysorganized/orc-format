@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use prost::Message;
 use bytes::Bytes;
 use crate::messages;
-use crate::schemata::{Schema, ColumnRef};
+use crate::schemata::{Schema, Column, DataFrame};
 use crate::errors::{OrcError, OrcResult};
 
 /// A handle on an open ORC file
@@ -262,14 +262,7 @@ pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
     }
 }
 
-/// A handle to one stripe in an ORCFile.
-///
-/// The stripe requires a mutable borrow because it needs to seek() the underlying reader,
-/// and it would be a mess if they shared cursors.
-/// If you need to use multiple stripes at a time, either open the file multiple times,
-/// with a new OrcFile for each one,
-/// or open an `std::io::Cursor` on an mmap of the file and clone the OrcFile at will.
-/// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
+/// Metadata about a single stripe in an ORC file
 #[derive(Debug, PartialEq)]
 pub struct Stripe {
     pub(crate) info: messages::StripeInformation,
@@ -309,25 +302,54 @@ impl Stripe {
     }
 
     /// Number of rows in this stripe
-    pub fn number_of_rows(&self) -> u64 {
-        self.info.number_of_rows()
+    pub fn rows(&self) -> usize {
+        self.info.number_of_rows() as usize
     }
 
-    /// Return the columns available in this stripe
-    pub fn columns(&self) -> OrcResult<Vec<ColumnRef>> {
+    /// Number of top-level columns in the schema associated with this stripe
+    ///
+    /// This is the same for every stripe but it's convenient to have handy
+    ///
+    /// Panics if the ORC file doesn't have a top-level struct
+    pub fn cols(&self) -> usize {
+        match &self.flat_schema[0] {
+            Schema::Struct{fields, ..} => fields.len(),
+            _ => panic!("This non-standard ORC doesn't have a top level schema.")
+        }
+    }
+
+    /// Read and return one column from the stripe
+    pub fn column<F: Read+Seek>(&self, id: usize, toc: &mut ORCFile<F>) -> OrcResult<Column> {
         if self.footer.columns.len() != self.flat_schema.len() {
             return Err(OrcError::SchemaError("Stripe column definitions don't match schema"))
         }
-        let mut cols = vec![];
-        for id in 0..self.flat_schema.len() {
-            cols.push(ColumnRef::new(
-                self,
-                &self.flat_schema[id], 
-                &self.footer.columns[id], 
-                &self.streams)?
-            );
-        }
-        Ok(cols)
+        Column::new(
+            self,
+            &self.flat_schema[id], 
+            &self.footer.columns[id], 
+            &self.streams,
+            toc
+        )
     }
 
+    /// Deserialize the stripe into a basic dataframe
+    pub fn dataframe<F: Read + Seek>(&self, toc: &mut ORCFile<F>) -> OrcResult<DataFrame> {
+        let mut columns = HashMap::new();
+        let mut column_order = vec![];
+        if let Schema::Struct{fields, ..} = &self.flat_schema[0] {
+            for (name, field) in fields {
+                column_order.push(name.clone());
+                columns.insert(name.clone(), Column::new(
+                    self,
+                    &self.flat_schema[field.id()], 
+                    &self.footer.columns[field.id()], 
+                    &self.streams,
+                    toc
+                )?);
+            }
+            Ok(DataFrame {column_order, columns, length: self.rows() })
+        } else {
+            panic!("This non-standard ORC doesn't have a top level schema. Can't create a dataframe.")
+        }
+    }
 }

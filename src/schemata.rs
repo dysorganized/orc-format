@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek};
-use crate::codecs::{Codec, PrimitiveBuffer};
+use bytes::Bytes;
+use crate::codecs;
 use crate::toc::{ORCFile, Stripe};
 use crate::messages;
 use crate::errors::*;
@@ -63,143 +64,152 @@ impl Schema {
     }
 }
 
+/// Joins multiple streams to create different composite types
+///
+/// This is where variable length types, like strings, are handled.
 #[derive(Debug, PartialEq)]
-pub struct ColumnRef<'t> {
-    pub(crate) stripe: &'t Stripe,
-    pub(crate) schema: Schema,
-    pub(crate) present: Option<Encoded>,
-    pub(crate) content: ColumnSpec
+pub enum Column {
+    /// Boolean RLE
+    Boolean {present: Option<Vec<bool>>, data: Vec<bool>},
+    /// RLE encoding for 8-bit integers and UNIONS. Unions aren't supported.
+    Byte {present: Option<Vec<bool>>, data: Vec<u8>},
+    /// `DIRECT` encoding, for all int sizes, booleans, bytes, dates.
+    /// For dates, the data is the days since 1970.  
+    Int {present: Option<Vec<bool>>, data: Vec<i128>},
+    /// `DIRECT` encoding for floats
+    Float {present: Option<Vec<bool>>, data: Vec<f64>},
+    /// `DIRECT` encoding for chars, strings, varchars, and blobs
+    Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
+    /// For maps and lists, the data is the length.
+    Container {present: Option<Vec<bool>>, length: Vec<u128>},
+    /// `DICTIONARY` encoding, only for chars, strings and varchars (not blobs)
+    Dict {present: Option<Vec<bool>>, data: Vec<u128>, length: Vec<u128>, dict: Vec<u8>},
+    /// Decimals, which store i128's with an associated scale.
+    Decimal {present: Option<Vec<bool>>, data: Vec<i128>, scale: Vec<i128> },
+    /// Timestamps, which store time since 1970, plus a second stream with nanoseconds
+    Timestamp {present: Option<Vec<bool>>, seconds: Vec<i128>, nanos: Vec<u128> },
+    /// Structs only store if they are present. The rest is in other columns.
+    Struct {present: Option<Vec<bool>>},
+    // Unions are not supported.
 }
-impl<'t> ColumnRef<'t> {
-    pub fn new(
-        stripe: &'t Stripe,
+
+impl Column {
+    pub fn new<F: Read+Seek>(
+        stripe: &Stripe,
         schema: &Schema,
         enc: &messages::ColumnEncoding,
-        streams: &HashMap<(u32, messages::stream::Kind), std::ops::Range<u64>>
-    ) -> OrcResult<ColumnRef<'t>> {
+        streams: &HashMap<(u32, messages::stream::Kind), std::ops::Range<u64>>,
+        orc: &mut ORCFile<F>
+    ) -> OrcResult<Column> {
         use messages::column_encoding::Kind as Ckind;
         use messages::stream::Kind as Skind;
-        let range_by_kind = |sk: Skind| streams
+        let mut slice_by_kind = |sk: Skind| streams
             .get(&(schema.id() as u32, sk))
             .cloned()
-            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", schema.id(), sk)));
+            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", schema.id(), sk)))
+            .and_then(|rng| orc.read_compressed(
+                stripe.info.offset() + rng.start
+                .. stripe.info.offset() + rng.end
+            ));
         // Most colspecs need these streams, so tee them up to save writing
-        let data = range_by_kind(Skind::Data);
-        let len = range_by_kind(Skind::Length);
+        let data = slice_by_kind(Skind::Data);
+        let len = slice_by_kind(Skind::Length);
+        let present = slice_by_kind(Skind::Present)
+                .and_then(|r| codecs::BooleanRLEDecoder::from(&r[..])
+                    .collect::<OrcResult<Vec<bool>>>())
+                .ok();
 
         // These integer encodings are mostly orthogonal to the types
-        let int_enc = |r| match enc.kind() {
-            Ckind::Direct | Ckind::Dictionary => Encoded(Codec::IntRLE1, r),
-            Ckind::DirectV2 | Ckind::DictionaryV2 => Encoded(Codec::IntRLE2, r)
+        let int_enc = |rs: Bytes| match enc.kind() {
+            Ckind::Direct | Ckind::Dictionary => codecs::RLE1::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>(),
+            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::RLE2::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>()
         };
-        let uint_enc = |r| match enc.kind() {
-            Ckind::Direct | Ckind::Dictionary => Encoded(Codec::UintRLE1, r),
-            Ckind::DirectV2 | Ckind::DictionaryV2 => Encoded(Codec::UintRLE2, r)
+        let uint_enc = |rs: Bytes| match enc.kind() {
+            Ckind::Direct | Ckind::Dictionary => codecs::RLE1::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>(),
+            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::RLE2::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>()
         };
         let content = match schema {
-            Schema::Boolean{..} => ColumnSpec::Boolean{data: Encoded(Codec::BooleanRLE, data?)},
-            Schema::Byte{..}   => ColumnSpec::Byte{data: Encoded(Codec::ByteRLE, data?)},
+            Schema::Boolean{..} => Column::Boolean{
+                present,
+                data: codecs::BooleanRLEDecoder::from(&data?[..])
+                // Booleans need to be trimmed because they round up to the nearest 8
+                .take(stripe.info.number_of_rows() as usize)
+                .collect::<OrcResult<_>>()?
+            },
+            Schema::Byte{..}   => Column::Byte{
+                present,
+                data: codecs::ByteRLEDecoder::from(&data?[..])
+                .collect::<OrcResult<_>>()?
+            },
             Schema::Short{..}
             | Schema::Int{..}
             | Schema::Long{..}
-            | Schema::Date{..} => ColumnSpec::Int{data: int_enc(data?)},
+            | Schema::Date{..} => Column::Int{present, data: int_enc(data?)?},
             Schema::Float{..}
-            | Schema::Double{..} => ColumnSpec::Float{data: Encoded(Codec::FloatEnc, data?)},
-            Schema::Decimal{..} => ColumnSpec::Decimal{
-                data: int_enc(data?),
-                scale: int_enc(range_by_kind(Skind::Secondary)?)
+            | Schema::Double{..} => {
+                // It would look like this
+                // ColumnContent::Float{data: FloatDecoder.from(data?)?}
+                todo!("Float decoding isn't supported yet for Column decoding")
+            },
+            Schema::Decimal{..} => Column::Decimal{
+                present,
+                data: int_enc(data?)?,
+                scale: int_enc(slice_by_kind(Skind::Secondary)?)?
             },
             Schema::String{..}
             | Schema::Varchar{..}
             | Schema::Char{..}
-            | Schema::Binary{..} => ColumnSpec::Blob{
-                data: Encoded(Codec::BinaryEnc, data?),
-                length: uint_enc(len?)
+            | Schema::Binary{..} => Column::Blob{
+                present,
+                data: codecs::ByteRLEDecoder::from(&data?[..])
+                    .collect::<OrcResult<_>>()?,
+                length: uint_enc(len?)?
             },
             Schema::Map{..}
-            | Schema::List{..} => ColumnSpec::Container{length: uint_enc(len?)},
-            Schema::Struct{..} => ColumnSpec::Struct(),
-            Schema::Timestamp{..} => ColumnSpec::Timestamp{
-                seconds: int_enc(data?),
-                nanos: match enc.kind() {
-                    Ckind::Direct => Encoded(Codec::NanosEnc1, range_by_kind(Skind::Secondary)?),
-                    Ckind::DirectV2 => Encoded(Codec::NanosEnc2, range_by_kind(Skind::Secondary)?),
-                    _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
-                }
+            | Schema::List{..} => Column::Container{present, length: uint_enc(len?)?},
+            Schema::Struct{..} => Column::Struct{present},
+            Schema::Timestamp{..} => {
+                // It could look something like this:
+                // ColumnContent::Timestamp{
+                //     seconds: int_enc(data?),
+                //     nanos: match enc.kind() {
+                //         Ckind::Direct => Codec::NanosEnc1.decode(range_by_kind(Skind::Secondary)?),
+                //         Ckind::DirectV2 => Codec::NanosEnc2.decode(range_by_kind(Skind::Secondary)?),
+                //         _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
+                //     }
+                // }
+                todo!("Timestamp decoding is not supported yet for Column decoding")
             },
             Schema::Union{..} => return Err(OrcError::SchemaError("Union types are not supported")),
         };
-        Ok(ColumnRef {
-            stripe,
-            schema: schema.clone(),
-            present: range_by_kind(Skind::Present)
-                .map(|r| Encoded(Codec::BooleanRLE, r))
-                .ok(),
-            content
-        })
+        Ok(content)
     }
 
-    /// Read the column from the same open ORC file.
-    ///
-    /// The read will only succeed for the same ORC file.
-    pub fn read_from<F: Read+Seek>(&self, file: &mut ORCFile<F>) -> OrcResult<()> {
-        if let ColumnSpec::Int{data} = &self.content {
-            // All the streams, even content streams, start their indices at the index start, not content start.
-            let enc = data;
-            let start = self.stripe.info.offset() + data.1.start;
-            let buf = file.read_compressed(start..start + enc.1.end - enc.1.start)?;
-            //file.file.seek(SeekFrom::Start(start))?;
-            //let mut buf = vec![0; data.1.end as usize - data.1.start as usize];
-            //file.file.read_exact(&mut buf[..])?; 
-            let prim_stream = data.decode(&buf)?;
-            match prim_stream {
-                PrimitiveBuffer::Int128(idec) => println!("Got ints {:?}", idec),
-                x => println!("nope for {:?}", x)
-            }
+    /// A stream indicating whether the row is non-null
+    /// 
+    /// If it's empty (e.g. None, not length 0) then all rows are present.
+    /// Keep in mind it's frequently the case all rows are present so expect None
+    pub fn present(&self) -> &Option<Vec<bool>> {
+        match self {
+            Self::Boolean {present, ..}
+            | Self::Byte {present, ..}
+            | Self::Int {present, ..}
+            | Self::Float {present, ..}
+            | Self::Blob {present, ..}
+            | Self::Container {present, ..}
+            | Self::Dict {present, ..}
+            | Self::Decimal {present, ..}
+            | Self::Timestamp {present, ..}
+            | Self::Struct {present} => present
         }
-        Ok(())
     }
 }
 
-/// Joins multiple streams to create different composite types
+/// An ordered set of columns; a deserialized stripe or file
 ///
-/// This is where variable length types, like strings, are handled.
-#[derive(Debug, Eq, PartialEq)]
-pub enum ColumnSpec {
-    /// Boolean RLE
-    Boolean {data: Encoded},
-    /// RLE encoding for 8-bit integers and UNIONS. Unions aren't supported.
-    Byte {data: Encoded},
-    /// `DIRECT` encoding, for all int sizes, booleans, bytes, dates.
-    /// For dates, the data is the days since 1970.  
-    Int {data: Encoded},
-    /// `DIRECT` encoding for floats
-    Float {data: Encoded},
-    /// `DIRECT` encoding for chars, strings, varchars, and blobs
-    Blob {data: Encoded, length: Encoded},
-    /// For maps and lists, the data is the length.
-    Container {length: Encoded},
-    /// `DICTIONARY` encoding, only for chars, strings and varchars (not blobs)
-    Dict {data: Encoded, length: Encoded, dict: Encoded},
-    /// Decimals, which store i128's with an associated scale.
-    Decimal {data: Encoded, scale: Encoded },
-    /// Timestamps, which store time since 1970, plus a second stream with nanoseconds
-    Timestamp {seconds: Encoded, nanos: Encoded },
-    /// Structs only store if they are present. The rest is in other columns.
-    Struct (),
-    // Unions are not supported.
-}
-
-/// Part of a stripe with a known encoding
-///
-/// This doesn't have a reference to the buffer because it may not have been read yet.
-/// (the offsets are available in the stripe footer).
-/// Once you have read the associated stripe, you can read it with the decode method.
-#[derive(Debug, Eq, PartialEq)]
-pub struct Encoded(pub Codec, pub std::ops::Range<u64>);
-impl Encoded {
-    /// Decode part of a buffer using this codec and subslice.
-    pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveBuffer> {
-        self.0.decode(buf)
-    }
+/// This is not a feature rich abstraction, just enough to make it easier to export
+pub struct DataFrame {
+    pub column_order: Vec<String>,
+    pub columns: HashMap<String, Column>,
+    pub length: usize
 }

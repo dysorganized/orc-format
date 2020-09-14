@@ -21,57 +21,6 @@ impl Sign for u128 {
     }
 }
 
-#[derive(Debug)]
-pub enum PrimitiveBuffer {
-    Boolean(Vec<bool>),
-    Byte(Vec<u8>),
-    Uint128(Vec<u128>),
-    Int128(Vec<i128>),
-    Float(Vec<f64>),
-    Binary(Vec<u8>)
-}
-
-/// Basic over the wire types, all primitives with a type-specific compression method
-#[derive(Debug, Eq, PartialEq, Copy, Clone)]
-pub enum Codec {
-    /// Boolean run length encoding
-    BooleanRLE,
-    /// One-byte signed integer run length encoding
-    ByteRLE,
-    /// Variable width signed integer run length encoding (for Hive < 0.12)
-    IntRLE1,
-    /// Variable width signed integer run length encoding (for Hive >= 0.12)
-    IntRLE2,
-    /// Variable width unsigned integer run length encoding (for Hive < 0.12)
-    UintRLE1,
-    /// Variable width unsigned integer run length encoding (for Hive >= 0.12)
-    UintRLE2,
-    /// Fixed width floating point IEEE754. Essentially raw.
-    FloatEnc,
-    /// Raw uncompressed slice, no encoding
-    BinaryEnc,
-    /// Integer encoding that mangles trailing zeros to reduce magnitude (for Hive < 0.12)
-    NanosEnc1,
-    /// Integer encoding that mangles trailing zeros to reduce magnitude (for Hive >= 0.12)
-    NanosEnc2
-}
-
-impl Codec {
-    /// Initialize the appropriate decoder for this encoding
-    pub fn decode<'t>(&self, buf: &'t [u8]) -> OrcResult<PrimitiveBuffer> {
-        use PrimitiveBuffer as PB;
-        Ok(match self {
-            Codec::BooleanRLE => PB::Boolean(BooleanRLEDecoder::from(buf).collect::<OrcResult<_>>()?),
-            Codec::ByteRLE => PB::Byte(ByteRLEDecoder::from(buf).collect::<OrcResult<_>>()?),
-            Codec::UintRLE1 => PB::Uint128(RLE1::<u128>::from(buf).collect::<OrcResult<_>>()?),
-            Codec::IntRLE1 => PB::Int128(RLE1::<i128>::from(buf).collect::<OrcResult<_>>()?),
-            Codec::UintRLE2 => PB::Uint128(RLE2::<u128>::from(buf).collect::<OrcResult<_>>()?),
-            Codec::IntRLE2 => PB::Int128(RLE2::<i128>::from(buf).collect::<OrcResult<_>>()?),
-            _ => todo!("Codec not implemented")
-        })
-    }
-}
-
 pub trait Decoder<'t> : std::fmt::Debug {
     type Output;
     fn remainder(&self) -> &'t [u8];
