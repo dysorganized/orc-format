@@ -1,6 +1,6 @@
 use num_traits::{Num, NumCast, PrimInt};
 use std::marker::PhantomData;
-use super::errors::*;
+use super::errors::*
 use crate::nibble::Nibble;
 
 /// Helper trait allowing RLE1/2 to work for both signed and unsigned
@@ -14,6 +14,7 @@ impl Sign for i128 {
         (value << 127 >> 127) ^ (value >> 1)
     }
 }
+
 impl Sign for u128 {
     // Don't do anything
     fn unzigzag(value: u128) -> Self {
