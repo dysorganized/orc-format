@@ -81,7 +81,34 @@ impl<F: Read+Seek> ORCFile<F> {
             };
             comp_buffer = &comp_buffer[chunk_len+3..];
         }
-        Ok(Bytes::from(decomp_buffer))
+        let (chunk_len, is_compressed) = match self.postscript.compression() {
+            messages::CompressionKind::None => (0, false),
+            _ => {
+                let enc = [comp_buffer[0], comp_buffer[1], comp_buffer[2], 0];
+                let enc_len = u32::from_le_bytes(enc);
+                ((enc_len / 2) as usize, (enc_len & 1 == 0))
+            }
+        };
+        let decomp_slice = match (is_compressed, self.postscript.compression()) {
+            (false, _) => {
+                &comp_buffer[3..]
+            }
+            (_, messages::CompressionKind::Zlib) => {
+                let mut decoder = flate2::read::DeflateDecoder::new(&comp_buffer[3..chunk_len+3]);
+                decoder.read_to_end(&mut decomp_buffer)?;
+                &decomp_buffer[..]
+            }
+            (_, messages::CompressionKind::Snappy) => {
+                let mut decoder = snap::read::FrameDecoder::new(&comp_buffer[3..chunk_len+3]);
+                decoder.read_to_end(&mut decomp_buffer)?;
+                &decomp_buffer[..]
+            }
+            _ => todo!("Only Zlib and Snappy compression is supported yet.")
+            // Lzo = 3,
+            // Lz4 = 4,
+            // Zstd = 5,
+        };
+        Ok(M::decode(decomp_slice)?)
     }
 
     /// Read the table of contents from something readable and seekable and keep the reader
