@@ -78,7 +78,11 @@ pub enum Column {
     /// For dates, the data is the days since 1970.  
     Int {present: Option<Vec<bool>>, data: Vec<i128>},
     /// `DIRECT` encoding for floats
-    Float {present: Option<Vec<bool>>, data: Vec<f64>},
+    Float {present: Option<Vec<bool>>, data: Vec<f32>},
+    /// `DIRECT` encoding for floats
+    Double {present: Option<Vec<bool>>, data: Vec<f64>},
+    /// `DIRECT` encoding for chars, strings, varchars, and blobs
+    String {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
     /// `DIRECT` encoding for chars, strings, varchars, and blobs
     Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
     /// For maps and lists, the data is the length.
@@ -146,21 +150,27 @@ impl Column {
             | Schema::Int{..}
             | Schema::Long{..}
             | Schema::Date{..} => Column::Int{present, data: int_enc(data?)?},
-            Schema::Float{..}
-            | Schema::Double{..} => {
-                // It would look like this
-                // ColumnContent::Float{data: FloatDecoder.from(data?)?}
-                todo!("Float decoding isn't supported yet for Column decoding")
+            Schema::Float{..}  => Column::Float{
+                present,
+                data: codecs::FloatDecoder::from(&data?[..])
+                .collect::<OrcResult<_>>()?
+            },
+            Schema::Double{..}  => Column::Double{
+                present,
+                data: codecs::DoubleDecoder::from(&data?[..])
+                .collect::<OrcResult<_>>()?
             },
             Schema::Decimal{..} => Column::Decimal{
                 present,
                 data: int_enc(data?)?,
                 scale: int_enc(slice_by_kind(Skind::Secondary)?)?
             },
+            Schema::Binary{..} => {
+                Column::Blob{present, data:data?.to_vec(), length: uint_enc(len?)?}
+            }
             Schema::String{..}
             | Schema::Varchar{..}
-            | Schema::Char{..}
-            | Schema::Binary{..} => Column::Blob{
+            | Schema::Char{..} => Column::Blob{
                 present,
                 data: codecs::ByteRLEDecoder::from(&data?[..])
                     .collect::<OrcResult<_>>()?,
@@ -196,7 +206,9 @@ impl Column {
             | Self::Byte {present, ..}
             | Self::Int {present, ..}
             | Self::Float {present, ..}
+            | Self::Double {present, ..}
             | Self::Blob {present, ..}
+            | Self::String {present, ..}
             | Self::Container {present, ..}
             | Self::Dict {present, ..}
             | Self::Decimal {present, ..}
@@ -248,9 +260,34 @@ impl Column {
             Column::Int { present, data }
         } else if type_guess.is_f64() {
             let (present, data) = Self::coerce_vec(items, |j| j.as_f64());
-            Column::Float { present, data }
+            Column::Double { present, data }
         } else {
             todo!("Unsupported JSON Column type yet: {:?}", type_guess);
+        }
+    }
+
+    /// Convert the column to s vector of strings, if it's possible.
+    ///
+    /// This does a whole lot of allocation, so expect it to be slow.
+    pub fn to_blobs(&self) -> Option<Vec<Option<Vec<u8>>>> {
+        match self {
+            Column::Blob{length, data, present}
+            | Column::String{length, data, present} => {
+                let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
+                let mut blobs: Vec<Option<Vec<u8>>> = vec![];
+                let mut byte_cursor = 0; // Where are we in the concatenated string
+                for blob_ix in 0..blob_count {
+                    if blobs.len() < length.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+                        let blob_len = length[blobs.len()] as usize;
+                        blobs.push(Some(data[byte_cursor..byte_cursor+blob_len].to_vec()));
+                        byte_cursor += blob_len;
+                    } else {
+                        blobs.push(None);
+                    }
+                }
+                Some(blobs)
+            },
+            _ => None // These are not blobs
         }
     }
 }
