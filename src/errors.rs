@@ -17,7 +17,9 @@ pub enum OrcError {
     #[error("End of stream")]
     EndOfStream,
     #[error("Bit sequence was too long for the target type. Are you reading a literal over 4GB on a 32bit machine?")]
-    LongBitstring
+    LongBitstring,
+    #[error("JSON deserialization error: {0}")]
+    SerdeError(#[from] serde_json::Error)
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;

@@ -152,7 +152,22 @@ fn read_column() {
 }
 
 #[test]
-fn read_empty_file() {
+fn go_read_empty_file() {
     let orc_bytes = include_bytes!("examples/TestOrcFile.emptyFile.orc");
     ORCFile::from_slice(&orc_bytes[..]).expect_err("ORC should have been empty");
+}
+
+#[test]
+fn go_read_metadata() {
+    let orc_bytes = include_bytes!("examples/TestOrcFile.metaData.orc");
+    let ref mut toc = ORCFile::from_slice(&orc_bytes[..]).unwrap();
+    let column = toc.stripe(0).unwrap().dataframe(toc).unwrap();
+    assert_eq!(toc.user_metadata(), hashmap! {"foo".into() => "bar".into()});
+}
+
+#[test]
+fn go_read_test1() {
+    let orc_bytes = include_bytes!("examples/TestOrcFile.test1.orc");
+    let ref mut toc = ORCFile::from_slice(&orc_bytes[..]).unwrap();
+    let column = toc.stripe(0).unwrap().dataframe(toc).unwrap();
 }

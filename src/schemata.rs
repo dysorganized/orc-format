@@ -1,6 +1,7 @@
 use std::collections::HashMap;
-use std::io::{Read, Seek};
+use std::io::{BufRead, Read, Seek};
 use bytes::Bytes;
+use serde_json as json;
 use crate::codecs;
 use crate::toc::{ORCFile, Stripe};
 use crate::messages;
@@ -64,9 +65,9 @@ impl Schema {
     }
 }
 
-/// Joins multiple streams to create different composite types
+/// Composite types made from multiple streams.
 ///
-/// This is where variable length types, like strings, are handled.
+/// These are analogous to Arrow formats, but not quite - specifically these are mutable.
 #[derive(Debug, PartialEq)]
 pub enum Column {
     /// Boolean RLE
@@ -203,13 +204,140 @@ impl Column {
             | Self::Struct {present} => present
         }
     }
+
+    /// Private method used by from_json to coerce JSON values into static types
+    fn coerce_vec<In, Out, F: Fn(&In) -> Option<Out>>(items: &[In], tran: F) -> (Option<Vec<bool>>, Vec<Out>) {
+        // The present stream just records nulls separately from the data stream, easy.
+        let coerced : Vec<_> = items.iter()
+            .map(tran)
+            .collect();
+        let present: Vec<bool> = coerced.iter().map(|it| it.is_some() ).collect();
+        let present = if present.iter().all(|x| *x) {
+            None
+        } else {
+            Some(present)
+        };
+        (present, coerced.into_iter().filter_map(|x| x).collect())
+    }
+
+    /// Read a column from a vector of JSON values
+    ///
+    /// This is infallible only because if there is a problem coercing a value, it's treated as null
+    ///
+    /// ```
+    /// use serde_json::json;
+    /// use orc_format::Column;
+    /// let orig = &[json!(1), json!(2), json!(3)];
+    /// assert_eq!(
+    ///     Column::from_json(orig),
+    ///     Column::from(vec![1i128, 2, 3])
+    /// );
+    /// ```
+    pub fn from_json(items: &[json::Value]) -> Self {
+        let type_guess = items
+            .iter()
+            .filter(|it| !it.is_null() )
+            .next()
+            .cloned()
+            .unwrap_or(json::Value::Bool(false));
+        if type_guess.is_boolean() {
+            let (present, data) = Self::coerce_vec(items, |j| j.as_bool());
+            Column::Boolean { present, data }
+        } else if type_guess.is_i64() {
+            let (present, data) = Self::coerce_vec(items, |j| j.as_i64().map(|x| x as i128));
+            Column::Int { present, data }
+        } else if type_guess.is_f64() {
+            let (present, data) = Self::coerce_vec(items, |j| j.as_f64());
+            Column::Float { present, data }
+        } else {
+            todo!("Unsupported JSON Column type yet: {:?}", type_guess);
+        }
+    }
 }
+// TODO: Write this more compactly
+macro_rules! basic_column_from_vec {
+    ($prim:ty, $constructor:path) => {
+        impl From<Vec<$prim>> for Column {
+            fn from(data: Vec<$prim>) -> Self {
+                $constructor { present: None, data }
+            }
+        }
+        impl From<Vec<Option<$prim>>> for Column {
+            fn from(data: Vec<Option<$prim>>) -> Self {
+                let (present, data) = Column::coerce_vec(&data, |d| d.map(|x| x.clone().into()));
+                $constructor { present, data }
+            }
+        }
+    }
+}
+basic_column_from_vec!(bool, Column::Boolean);
+basic_column_from_vec!(i128, Column::Int);
+
 
 /// An ordered set of columns; a deserialized stripe or file
 ///
 /// This is not a feature rich abstraction, just enough to make it easier to export
+#[derive(Default, Debug, PartialEq)]
 pub struct DataFrame {
     pub column_order: Vec<String>,
     pub columns: HashMap<String, Column>,
     pub length: usize
+}
+impl DataFrame {
+    /// Read a dataframe from newline separated JSON records. Column order is not preserved.
+    ///
+    /// Reading from a slice is fairly easy using std::io::Cursor if needed
+    pub fn from_json_lines<F: Read>(reader: F) -> OrcResult<Self> {
+        // This is written for simplicity rather than speed.
+        // It buffers the json Value enums, which wastes space.
+        // But it's intended for tests mostly, so speed should not be a problem.
+        let line_reader = std::io::BufReader::new(reader).lines();
+
+        let mut frame = HashMap::new();
+        let mut header = true;
+        for line in line_reader {
+            let mut row: HashMap<String, json::Value> = json::from_str(&line?)?;
+            if header {
+                for column_name in row.keys() {
+                    frame.insert(column_name.to_owned(), vec![]);
+                }
+                header = false;
+            }
+            for (name, column) in &mut frame {
+                match row.remove(name) {
+                    Some(cell) => column.push(cell),
+                    None => column.push(json::Value::Null)
+                }
+            }
+        }
+        Ok(DataFrame {
+            column_order: frame.keys().cloned().collect(),
+            length: frame.values().next().map(|c| c.len()).unwrap_or(0),
+            columns: frame.into_iter().map(|(k, v)| (k, Column::from_json(&v))).collect()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Column;
+    #[test]
+    fn test_column_coerce_vec() {
+        // Mixed types
+        let items = &[json!(true), json!(false), json!(null), json!("foo")];
+        let (present, data) = Column::coerce_vec(items, |j| j.as_bool());
+        assert_eq!(present, Some(vec![true, true, false, false]));
+        assert_eq!(data , vec![true, false]);
+
+        // All present
+        let items = &[json!(true), json!(false)];
+        let (present, data) = Column::coerce_vec(items, |j| j.as_bool());
+        assert_eq!(present, None);
+        assert_eq!(data , vec![true, false]);
+    }
+    #[test]
+    fn column_from_json() {
+        let orig = &[json!(1), json!(2), json!(3)];
+        Column::from_json(orig);
+    }
 }
