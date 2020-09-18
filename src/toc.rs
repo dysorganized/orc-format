@@ -209,6 +209,7 @@ impl<F: Read+Seek> ORCFile<F> {
         &self.schema
     }
 
+
     /// Get a reference to all columns and their descendants
     ///
     /// These are still trees, but in this case all subtrees are listed in the top level vector.
@@ -217,20 +218,27 @@ impl<F: Read+Seek> ORCFile<F> {
         &self.flat_schema
     }
 
-    /// Get information about one stripe in the file
+    /// Get information about one stripe in the file.
     ///
-    /// The stripe requires a mutable borrow because it needs to seek() the underlying reader,
-    /// and it would be a mess if they shared cursors.
-    /// If you need to use multiple stripes at a time, either open the file multiple times,
-    /// with a new OrcFile for each one,
-    /// or open an `std::io::Cursor` on an mmap of the file and clone the OrcFile at will.
-    /// You can't clone an OrcFile based on std::fs::file but you can clone a mmap based OrcFile.
+    /// This only includes the metadata necessary to read the stripe, but doesn't retain a reference
+    /// to the original file (to make ownership with threads easier)
     pub fn stripe(&mut self, stripe_id: usize) -> OrcResult<Stripe> {
         if stripe_id < self.footer.stripes.len() {
             Stripe::new(stripe_id,self)
         } else {
             Err(OrcError::NoSuchStripe(stripe_id))
         }
+    }
+
+    /// Get the number of stripes in this file
+    pub fn stripe_count(&self) -> usize {
+        self.footer.stripes.len()
+    }
+
+    /// Consume the file, iterating over all stripes, yielding dataframes
+    pub fn dataframes(mut self) -> impl Iterator<Item=OrcResult<DataFrame>> {
+        (0..self.stripe_count())
+        .map(move |stripe_id: usize| self.stripe(stripe_id).and_then(|st| st.dataframe(&mut self)))
     }
 }
 
