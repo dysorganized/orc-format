@@ -93,8 +93,6 @@ pub enum Column {
 
     /// For maps and lists, the data is the length.
     Container {present: Option<Vec<bool>>, length: Vec<u128>},
-    /// `DICTIONARY` encoding, only for chars, strings and varchars (not blobs)
-    Dict {present: Option<Vec<bool>>, data: Vec<u128>, length: Vec<u128>, dict: Vec<u8>},
     /// Decimals, which store i128's with an associated scale.
     Decimal {present: Option<Vec<bool>>, data: Vec<i128>, scale: Vec<i128> },
     /// Timestamps, which store time since 1970, plus a second stream with nanoseconds
@@ -253,7 +251,6 @@ impl Column {
             | Self::Blob {present, ..}
             | Self::BlobDict {present, ..}
             | Self::Container {present, ..}
-            | Self::Dict {present, ..}
             | Self::Decimal {present, ..}
             | Self::Timestamp {present, ..}
             | Self::Struct {present} => present
