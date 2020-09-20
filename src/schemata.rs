@@ -316,10 +316,8 @@ impl Column {
                     },
                 }
             }
-            Schema::Map { .. } | Schema::List { .. } => Column::Container {
-                present,
-                length: uint_enc(len?)?,
-            },
+            Schema::Map { .. } => todo!("Map columns are not supported yet."),
+            Schema::List { .. } => todo!("List columns are not supported yet."),
             Schema::Struct { .. } => Column::Struct { present },
             Schema::Timestamp { .. } => {
                 // It could look something like this:
@@ -353,7 +351,8 @@ impl Column {
             | Self::Double { present, .. }
             | Self::Blob { present, .. }
             | Self::BlobDict { present, .. }
-            | Self::Container { present, .. }
+            | Self::Map { present, .. }
+            | Self::List { present, .. }
             | Self::Decimal { present, .. }
             | Self::Timestamp { present, .. }
             | Self::Struct { present } => present,
