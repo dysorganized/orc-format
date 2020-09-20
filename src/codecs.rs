@@ -1,10 +1,10 @@
-use num_traits::{Num, NumCast, PrimInt};
-use std::{marker::PhantomData, convert::TryInto};
 use super::errors::*;
 use crate::nibble::Nibble;
+use num_traits::{Num, NumCast, PrimInt};
+use std::{convert::TryInto, marker::PhantomData};
 
 /// Helper trait allowing RLE1/2 to work for both signed and unsigned
-pub trait Sign : Num + Copy + NumCast + PrimInt + std::fmt::Debug {
+pub trait Sign: Num + Copy + NumCast + PrimInt + std::fmt::Debug {
     fn unzigzag(value: u128) -> Self;
 }
 impl Sign for i128 {
@@ -22,7 +22,7 @@ impl Sign for u128 {
     }
 }
 
-pub trait Decoder<'t> : std::fmt::Debug {
+pub trait Decoder<'t>: std::fmt::Debug {
     type Output;
     fn remainder(&self) -> &'t [u8];
     fn next_result(&mut self) -> OrcResult<Self::Output>;
@@ -39,11 +39,11 @@ macro_rules! decoder_iter {
                 match self.next_result() {
                     Ok(x) => Some(Ok(x)),
                     Err(OrcError::EndOfStream) => None,
-                    Err(x) => Some(Err(x))
+                    Err(x) => Some(Err(x)),
                 }
             }
         }
-    }
+    };
 }
 
 /// Byte level RLE, encoding up to 128 byte literals and up to 130 byte runs
@@ -54,12 +54,17 @@ pub struct ByteRLEDecoder<'t> {
     buf: &'t [u8],
     run: isize,
     run_item: u8,
-    literal: isize
+    literal: isize,
 }
 decoder_iter!(ByteRLEDecoder<'t>, u8);
-impl<'t> From<&'t[u8]> for ByteRLEDecoder<'t> {
-    fn from(buf: &'t[u8]) -> Self {
-        ByteRLEDecoder {buf, run:0, literal:0, run_item:0}
+impl<'t> From<&'t [u8]> for ByteRLEDecoder<'t> {
+    fn from(buf: &'t [u8]) -> Self {
+        ByteRLEDecoder {
+            buf,
+            run: 0,
+            literal: 0,
+            run_item: 0,
+        }
     }
 }
 impl<'t> Decoder<'t> for ByteRLEDecoder<'t> {
@@ -110,11 +115,11 @@ impl<'t> Decoder<'t> for ByteRLEDecoder<'t> {
 /// 32 bit float storage. It's not so much an encoding as just an array.
 #[derive(Debug)]
 pub struct FloatDecoder<'t> {
-    buf: &'t [u8]
+    buf: &'t [u8],
 }
 decoder_iter!(FloatDecoder<'t>, f32);
-impl<'t> From<&'t[u8]> for FloatDecoder<'t> {
-    fn from(buf: &'t[u8]) -> Self {
+impl<'t> From<&'t [u8]> for FloatDecoder<'t> {
+    fn from(buf: &'t [u8]) -> Self {
         FloatDecoder { buf }
     }
 }
@@ -137,11 +142,11 @@ impl<'t> Decoder<'t> for FloatDecoder<'t> {
 /// 64 bit float storage. It's not so much an encoding as just an array.
 #[derive(Debug)]
 pub struct DoubleDecoder<'t> {
-    buf: &'t [u8]
+    buf: &'t [u8],
 }
 decoder_iter!(DoubleDecoder<'t>, f64);
-impl<'t> From<&'t[u8]> for DoubleDecoder<'t> {
-    fn from(buf: &'t[u8]) -> Self {
+impl<'t> From<&'t [u8]> for DoubleDecoder<'t> {
+    fn from(buf: &'t [u8]) -> Self {
         DoubleDecoder { buf }
     }
 }
@@ -169,15 +174,15 @@ impl<'t> Decoder<'t> for DoubleDecoder<'t> {
 pub struct BooleanRLEDecoder<'t> {
     buf: ByteRLEDecoder<'t>,
     bit: usize,
-    byte: u8
+    byte: u8,
 }
 decoder_iter!(BooleanRLEDecoder<'t>, bool);
-impl<'t> From<&'t[u8]> for BooleanRLEDecoder<'t> {
-    fn from(buf: &'t[u8]) -> Self {
+impl<'t> From<&'t [u8]> for BooleanRLEDecoder<'t> {
+    fn from(buf: &'t [u8]) -> Self {
         BooleanRLEDecoder {
             buf: ByteRLEDecoder::from(buf),
             bit: 0,
-            byte: 0
+            byte: 0,
         }
     }
 }
@@ -200,13 +205,16 @@ impl<'t> Decoder<'t> for BooleanRLEDecoder<'t> {
 #[derive(Debug)]
 pub struct VarDecoder<'t, S: Sign> {
     buf: &'t [u8],
-    ghost: PhantomData<S>
+    ghost: PhantomData<S>,
 }
 decoder_iter!(VarDecoder<'t, i128>, i128);
 decoder_iter!(VarDecoder<'t, u128>, u128);
-impl<'t, S: Sign> From<&'t[u8]> for VarDecoder<'t, S> {
-    fn from(buf: &'t[u8]) -> Self {
-        VarDecoder {buf, ghost: PhantomData}
+impl<'t, S: Sign> From<&'t [u8]> for VarDecoder<'t, S> {
+    fn from(buf: &'t [u8]) -> Self {
+        VarDecoder {
+            buf,
+            ghost: PhantomData,
+        }
     }
 }
 impl<'t, S: Sign> Decoder<'t> for VarDecoder<'t, S> {
@@ -223,10 +231,10 @@ impl<'t, S: Sign> Decoder<'t> for VarDecoder<'t, S> {
             // because 7 * 18 = 126, and the MSB will still be taken out of the last byte, so that leaves 5 extra.
             // The docs don't mention what happens with those bits. We're gambling that they are zeros
             // but to be pedantic you could add a conditional to check the length. Hopefully that's not necessary.
-            value |= byte.wrapping_shl(7*i as u32);
+            value |= byte.wrapping_shl(7 * i as u32);
             if self.buf[i] & 0x80 == 0 {
                 // The most significant bit in each byte (0x80) indicates if the integer continues in the next byte
-                self.buf = &self.buf[i+1..];
+                self.buf = &self.buf[i + 1..];
                 return Ok(S::unzigzag(value));
             }
         }
@@ -247,13 +255,20 @@ pub struct RLE1<'t, S: Sign> {
     literal: isize,
     run_item: S,
     delta: S,
-    ghost: PhantomData<S>
+    ghost: PhantomData<S>,
 }
 decoder_iter!(RLE1<'t, u128>, u128);
 decoder_iter!(RLE1<'t, i128>, i128);
 impl<'t, S: Sign> From<&'t [u8]> for RLE1<'t, S> {
-    fn from(buf: &'t[u8]) -> Self {
-        RLE1{buf: buf.into(), run:0, literal: 0, run_item: S::unzigzag(0), delta: S::unzigzag(0), ghost: PhantomData}
+    fn from(buf: &'t [u8]) -> Self {
+        RLE1 {
+            buf: buf.into(),
+            run: 0,
+            literal: 0,
+            run_item: S::unzigzag(0),
+            delta: S::unzigzag(0),
+            ghost: PhantomData,
+        }
     }
 }
 /// Most of the RLE implementations look similar. Look at the ByteRLE for the clearest example
@@ -274,11 +289,14 @@ impl<'t, S: Sign> Decoder<'t> for RLE1<'t, S> {
             self.literal -= 1;
             self.buf.next_result().map_err(|err| match err {
                 OrcError::EndOfStream => OrcError::TruncatedError("IntRLE1 literal cut short"),
-                x => x
+                x => x,
             })
         } else {
             // Start the next run
-            let (flag, rest) = self.remainder().split_first().ok_or(OrcError::EndOfStream)?;
+            let (flag, rest) = self
+                .remainder()
+                .split_first()
+                .ok_or(OrcError::EndOfStream)?;
             let flag = *flag as i8;
             if flag < 0 {
                 self.literal = -(flag as isize);
@@ -286,12 +304,14 @@ impl<'t, S: Sign> Decoder<'t> for RLE1<'t, S> {
             } else {
                 // The minimum run size is 3, so they hard coded that
                 self.run = 3 + (flag as isize);
-                let (delta, rest) = rest.split_first().ok_or(OrcError::TruncatedError("IntRLE1 missing run delta"))?;
+                let (delta, rest) = rest
+                    .split_first()
+                    .ok_or(OrcError::TruncatedError("IntRLE1 missing run delta"))?;
                 self.buf = rest.into();
                 self.delta = S::unzigzag(*delta as u128);
                 self.run_item = self.buf.next_result().map_err(|err| match err {
                     OrcError::EndOfStream => OrcError::TruncatedError("IntRLE1 missing run item"),
-                    x => x
+                    x => x,
                 })?;
             }
             self.next_result()
@@ -305,10 +325,10 @@ impl<'t, S: Sign> Decoder<'t> for RLE1<'t, S> {
 #[derive(Debug)]
 pub struct RLE2<'t, Inner> {
     nib: Nibble<'t>,
-    mode: RLE2Mode<'t,Inner>,
+    mode: RLE2Mode<'t, Inner>,
     width: usize,
     length: usize,
-    ghost: std::marker::PhantomData<Inner>
+    ghost: std::marker::PhantomData<Inner>,
 }
 
 /// RLE2 switches between four modes of operation.
@@ -317,36 +337,38 @@ pub struct RLE2<'t, Inner> {
 enum RLE2Mode<'t, Inner> {
     ShortRepeat(Inner),
     Direct,
-    PatchedBase{
+    PatchedBase {
         base: Inner,
         patch_width: usize,
         patch_gap_width: usize,
         remaining_patches: usize,
         remaining_patch_gap: usize,
-        patch_buffer: Nibble<'t>
+        patch_buffer: Nibble<'t>,
     },
     Delta {
         // See comments in get_mode on why base is i128
         base: i128,
         first_delta: i128,
-        consumed: usize
-    }
+        consumed: usize,
+    },
 }
 decoder_iter!(RLE2<'t, u128>, u128);
 decoder_iter!(RLE2<'t, i128>, i128);
 impl<'t, S: Sign> From<&'t [u8]> for RLE2<'t, S> {
-    fn from(buf: &'t[u8]) -> Self {
-        RLE2{
-            nib: Nibble{buf: buf.into(), start: 0},
+    fn from(buf: &'t [u8]) -> Self {
+        RLE2 {
+            nib: Nibble {
+                buf: buf.into(),
+                start: 0,
+            },
             mode: RLE2Mode::Direct,
             width: 0,
             length: 0,
-            ghost: std::marker::PhantomData
+            ghost: std::marker::PhantomData,
         }
     }
 }
 impl<'t, S: Sign> RLE2<'t, S> {
-
     /// Decode the bit widths as they are stored in 5 bits
     fn decode_width(&mut self) -> OrcResult<usize> {
         // Convert encoded to decoded widths for certain modes
@@ -361,7 +383,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
             // The rest break it
             26, 28, 30, 32, 40, 48, 56, 64
         ];
-        let width_before : usize = self.nib.read(5, "RLE2 header width")?;
+        let width_before: usize = self.nib.read(5, "RLE2 header width")?;
         Ok(bit_width_encoding[width_before])
     }
 
@@ -379,17 +401,17 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // where E, W, L = encoding, width, length
                 self.width = self.nib.read::<usize>(3, "RLE2 short read width")? + 1;
                 self.length = self.nib.read::<usize>(3, "RLE2 short repeat length")? + 3;
-                let elem = self.nib.read(self.width*8, "RLE2 short repeat element")?;
-                
+                let elem = self.nib.read(self.width * 8, "RLE2 short repeat element")?;
+
                 self.mode = RLE2Mode::ShortRepeat(elem);
-            },
+            }
             1 => {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
                 // where E, W, L = encoding, width, length
                 self.width = self.decode_width()?;
                 self.length = self.nib.read::<usize>(9, "RLE2 header length")? + 1;
                 self.mode = RLE2Mode::Direct;
-            },
+            }
             2 => {
                 // The first four bytes look like EEWWWWWL LLLLLLLL BBBPPPPP GGGNNNNN
                 // where E, W, L = encoding, width, length
@@ -405,7 +427,10 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // The rest are extra parameters not found in the other modes
                 let base_width = self.nib.read::<usize>(3, "RLE2 patched base: base width")? + 1;
                 let patch_width = self.decode_width()?;
-                let patch_gap_width = self.nib.read::<usize>(3, "RLE2 patched base: patch gap width")? + 1;
+                let patch_gap_width = self
+                    .nib
+                    .read::<usize>(3, "RLE2 patched base: patch gap width")?
+                    + 1;
                 let remaining_patches = self.nib.read(5, "RLE2 patched base: patch list length")?; // can be 0
 
                 // NOTE: The spec seems ambiguous here:
@@ -418,19 +443,20 @@ impl<'t, S: Sign> RLE2<'t, S> {
 
                 let mut patch_buffer = Nibble {
                     buf: self.nib.buf,
-                    start: (self.nib.start + (self.width * self.length)) + 7 / 8
+                    start: (self.nib.start + (self.width * self.length)) + 7 / 8,
                 };
-                let remaining_patch_gap = patch_buffer.read(patch_gap_width, "RLE2 initial patch gap")?;
+                let remaining_patch_gap =
+                    patch_buffer.read(patch_gap_width, "RLE2 initial patch gap")?;
 
-                self.mode = RLE2Mode::PatchedBase{
+                self.mode = RLE2Mode::PatchedBase {
                     base: S::unzigzag(base),
                     patch_width,
                     patch_gap_width,
                     remaining_patches,
                     remaining_patch_gap,
-                    patch_buffer 
+                    patch_buffer,
                 };
-            },
+            }
             3 => {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
                 // where E, W, L = encoding, width, length
@@ -445,16 +471,20 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 // Then we will do a no-op conversion later to get either u128 or i128 as necessary.
                 //
                 // Unlike the other modes of RLE2 these are legit varints with MSB flags like protobuf uses
-                let base: S = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
-                let first_delta = self.nib.byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
+                let base: S = self
+                    .nib
+                    .byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
+                let first_delta = self
+                    .nib
+                    .byte_level_interlude(|x| VarDecoder::from(x).read_one())?;
                 self.mode = RLE2Mode::Delta {
                     // Everything should fit in an i128
                     base: NumCast::from(base).unwrap(),
                     first_delta,
-                    consumed: 0
+                    consumed: 0,
                 }
-            },
-            _ => unreachable!() 
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }
@@ -471,45 +501,49 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         }
         self.length = self.length.saturating_sub(1);
         match self.mode {
-            RLE2Mode::ShortRepeat(item) => {
-                Ok(item) 
-            }
-            RLE2Mode::Direct => {
-                self.nib.read(self.width, "RLE2 direct encoded int")
-            }
-            RLE2Mode::PatchedBase{
+            RLE2Mode::ShortRepeat(item) => Ok(item),
+            RLE2Mode::Direct => self.nib.read(self.width, "RLE2 direct encoded int"),
+            RLE2Mode::PatchedBase {
                 base,
                 patch_width,
                 patch_gap_width,
                 ref mut remaining_patches,
                 ref mut remaining_patch_gap,
-                ref mut patch_buffer
+                ref mut patch_buffer,
             } => {
                 let mut value = base;
                 value = value + self.nib.read(self.width, "RLE2 patched base delta")?;
                 if *remaining_patch_gap == 0 && *remaining_patches > 0 {
                     // The patch (if present) must be applied before the addition
-                    value = value + (patch_buffer.read::<S>(patch_width, "RLE2 patched base: patch")? << self.width);
+                    value = value
+                        + (patch_buffer.read::<S>(patch_width, "RLE2 patched base: patch")?
+                            << self.width);
                     *remaining_patches -= 1;
                     if *remaining_patches > 0 {
-                        *remaining_patch_gap = patch_buffer.read(patch_gap_width, "RLE2 patched base: patch gap")?;
+                        *remaining_patch_gap =
+                            patch_buffer.read(patch_gap_width, "RLE2 patched base: patch gap")?;
                     }
                 }
                 *remaining_patch_gap = remaining_patch_gap.saturating_sub(1);
                 // We need the main nibble to catch up to the patch nibble when the patched base mode is done
                 if self.length == 0 {
-                    std::mem::swap(&mut self.nib,  patch_buffer);
+                    std::mem::swap(&mut self.nib, patch_buffer);
                     self.nib.round_up();
                 }
                 Ok(value)
             }
-            RLE2Mode::Delta{ref mut base, first_delta, ref mut consumed} => {
+            RLE2Mode::Delta {
+                ref mut base,
+                first_delta,
+                ref mut consumed,
+            } => {
                 match *consumed {
                     0 => (),
-                    1 => *base += first_delta, 
-                    _ => *base +=
-                        first_delta.signum()
-                        * self.nib.read::<i128>(self.width, "RLE2 delta: delta")?
+                    1 => *base += first_delta,
+                    _ => {
+                        *base += first_delta.signum()
+                            * self.nib.read::<i128>(self.width, "RLE2 delta: delta")?
+                    }
                 };
                 *consumed += 1;
                 NumCast::from(*base).ok_or(OrcError::LongBitstring)
@@ -517,4 +551,3 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         }
     }
 }
-

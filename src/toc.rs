@@ -1,10 +1,10 @@
-use std::io::{Read, Seek, SeekFrom, Cursor};
-use std::collections::HashMap;
-use prost::Message;
-use bytes::Bytes;
-use crate::messages;
-use crate::schemata::{Schema, Column, DataFrame};
 use crate::errors::{OrcError, OrcResult};
+use crate::messages;
+use crate::schemata::{Column, DataFrame, Schema};
+use bytes::Bytes;
+use prost::Message;
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 /// A handle on an open ORC file
 ///
@@ -12,18 +12,18 @@ use crate::errors::{OrcError, OrcResult};
 /// because it has at this point only deserialized the table of contents.
 /// Reading a stripe will incur further IO and hence can fail.
 #[derive(Debug, Clone)]
-pub struct ORCFile<F: Read+Seek> {
+pub struct ORCFile<F: Read + Seek> {
     schema: Vec<(String, Schema)>,
     flat_schema: Vec<Schema>,
     metadata: messages::Metadata,
     footer: messages::Footer,
     postscript: messages::PostScript,
-    file: F
+    file: F,
 }
 
-impl<F: Read+Seek> ORCFile<F> {
+impl<F: Read + Seek> ORCFile<F> {
     /// Read a compressed Protobuf message from the file
-    fn read_message<M: Message+Default>(&mut self, rng: std::ops::Range<u64>) -> OrcResult<M> {
+    fn read_message<M: Message + Default>(&mut self, rng: std::ops::Range<u64>) -> OrcResult<M> {
         Ok(M::decode(self.read_compressed(rng)?)?)
     }
 
@@ -38,7 +38,7 @@ impl<F: Read+Seek> ORCFile<F> {
         let mut comp_buffer = &comp_buffer_back[..];
 
         // Start decompressing
-        let mut decomp_buffer= vec![];
+        let mut decomp_buffer = vec![];
         while comp_buffer.len() >= 4 {
             let (chunk_len, is_compressed) = match self.postscript.compression() {
                 // Messages without compression have no header
@@ -71,7 +71,7 @@ impl<F: Read+Seek> ORCFile<F> {
                 // Lz4 = 4,
                 // Zstd = 5,
             };
-            comp_buffer = &comp_buffer[chunk_len+3..];
+            comp_buffer = &comp_buffer[chunk_len + 3..];
         }
         Ok(Bytes::from(decomp_buffer))
     }
@@ -85,7 +85,7 @@ impl<F: Read+Seek> ORCFile<F> {
         let file_len = file.seek(SeekFrom::End(0))?;
         let buffer_len = file_len.min(275);
         if buffer_len == 0 {
-            return Err(OrcError::TruncatedError("Empty file"))
+            return Err(OrcError::TruncatedError("Empty file"));
         }
         file.seek(SeekFrom::End(-(buffer_len as i64)))?;
         let mut buffer = vec![0u8; buffer_len as usize];
@@ -101,13 +101,13 @@ impl<F: Read+Seek> ORCFile<F> {
             // read_message wants an ORCFile, but we need read_message to create the members
             // This is fine because these messages have defaults we can overwrite
             metadata: messages::Metadata::default(),
-            footer: messages::Footer::default()
+            footer: messages::Footer::default(),
         };
         // The file ends with the metadata, footer, postacript, and one last byte for the postscript length
         let postscript_start = file_len - *buffer.last().unwrap() as u64 - 1;
         let footer_start = postscript_start - me.postscript.footer_length();
         let metadata_start = footer_start - me.postscript.metadata_length();
-        
+
         me.footer = me.read_message::<messages::Footer>(footer_start..postscript_start)?;
         me.metadata = me.read_message::<messages::Metadata>(metadata_start..footer_start)?;
         let (schema, flat_schema) = me.read_schema(&me.footer.types)?;
@@ -120,7 +120,9 @@ impl<F: Read+Seek> ORCFile<F> {
     ///
     /// Metadata is usually tiny, and often missing altogether. This may be empty.
     pub fn user_metadata(&self) -> HashMap<String, Vec<u8>> {
-        self.footer.metadata.iter()
+        self.footer
+            .metadata
+            .iter()
             .map(|kv| (kv.name().to_string(), kv.value().to_vec()))
             .collect()
     }
@@ -130,7 +132,10 @@ impl<F: Read+Seek> ORCFile<F> {
     /// Returns a tuple, containing:
     /// * the top level columns in order as a vector with names
     /// * all columns in the order they were stored (preorder by spec)
-    fn read_schema(&self, raw_types: &[messages::Type]) -> OrcResult<(Vec<(String, Schema)>, Vec<Schema>)> {
+    fn read_schema(
+        &self,
+        raw_types: &[messages::Type],
+    ) -> OrcResult<(Vec<(String, Schema)>, Vec<Schema>)> {
         // These are the types not yet claimed as children of another type.
         // At the end of the traversal, these are the roots of the type trees,
         // and are the types of each column, in order
@@ -141,9 +146,11 @@ impl<F: Read+Seek> ORCFile<F> {
         // It's helpful because it gives a sensible error instead or panicing if there are no roots
         // It can't own the roots vector because then we couldn't also push to it.
         // All the places we need it will also need to be Boxed to avoid making ColumnSpec infinitely recursive.
-        let pop = |t: &mut Vec<Schema>| t.pop()
-            .ok_or(OrcError::SchemaError("Missing child type"))
-            .map(|x| Box::new(x));
+        let pop = |t: &mut Vec<Schema>| {
+            t.pop()
+                .ok_or(OrcError::SchemaError("Missing child type"))
+                .map(|x| Box::new(x))
+        };
 
         // The types are given in pre-order,
         // and for lack of imagination we iterate the types in reverse order to create the trees bottom-up.
@@ -152,42 +159,59 @@ impl<F: Read+Seek> ORCFile<F> {
             // This import helps reduce the noise
             use messages::r#type::Kind;
             let next_type = match raw_type.kind() {
-                Kind::Boolean => Schema::Boolean{id},
-                Kind::Byte => Schema::Byte{id},
-                Kind::Short => Schema::Short{id},
-                Kind::Int => Schema::Int{id},
-                Kind::Long => Schema::Long{id},
-                Kind::Float => Schema::Float{id},
-                Kind::Double => Schema::Double{id},
-                Kind::String => Schema::String{id},
-                Kind::Binary => Schema::Binary{id},
-                Kind::Timestamp
-                | Kind::TimestampInstant => Schema::Timestamp{id},
-                Kind::List => Schema::List{id, inner: pop(&mut roots)?},
+                Kind::Boolean => Schema::Boolean { id },
+                Kind::Byte => Schema::Byte { id },
+                Kind::Short => Schema::Short { id },
+                Kind::Int => Schema::Int { id },
+                Kind::Long => Schema::Long { id },
+                Kind::Float => Schema::Float { id },
+                Kind::Double => Schema::Double { id },
+                Kind::String => Schema::String { id },
+                Kind::Binary => Schema::Binary { id },
+                Kind::Timestamp | Kind::TimestampInstant => Schema::Timestamp { id },
+                Kind::List => Schema::List {
+                    id,
+                    inner: pop(&mut roots)?,
+                },
                 Kind::Map => {
                     // Undo reverse subtype order
                     let (value, key) = (pop(&mut roots)?, pop(&mut roots)?);
-                    Schema::Map{id, key, value}
-                },
+                    Schema::Map { id, key, value }
+                }
                 Kind::Struct => {
                     if raw_type.field_names.len() != raw_type.subtypes.len() {
-                        return Err(OrcError::SchemaError("Field names don't match field types in struct"))
+                        return Err(OrcError::SchemaError(
+                            "Field names don't match field types in struct",
+                        ));
                     }
                     // Keep in mind these subtypes will be in reverse order, note rev() before zip()
-                    let subtypes = roots.split_off(roots.len()-raw_type.subtypes.len());
+                    let subtypes = roots.split_off(roots.len() - raw_type.subtypes.len());
                     // We already own the subtypes but we have to clone the field names
-                    let fields = raw_type.field_names.iter().cloned().zip(subtypes.into_iter().rev()).collect();
-                    Schema::Struct{id, fields}
-                },
-                Kind::Union => return Err(OrcError::SchemaError("Union types are not yet supported")),
-                Kind::Decimal => Schema::Decimal{
+                    let fields = raw_type
+                        .field_names
+                        .iter()
+                        .cloned()
+                        .zip(subtypes.into_iter().rev())
+                        .collect();
+                    Schema::Struct { id, fields }
+                }
+                Kind::Union => {
+                    return Err(OrcError::SchemaError("Union types are not yet supported"))
+                }
+                Kind::Decimal => Schema::Decimal {
                     id,
                     precision: raw_type.precision() as usize,
-                    scale: raw_type.scale() as usize
+                    scale: raw_type.scale() as usize,
                 },
-                Kind::Date => Schema::Date{id},
-                Kind::Varchar => Schema::Varchar{id, length: raw_type.maximum_length() as usize},
-                Kind::Char => Schema::Char{id, length: raw_type.maximum_length() as usize},
+                Kind::Date => Schema::Date { id },
+                Kind::Varchar => Schema::Varchar {
+                    id,
+                    length: raw_type.maximum_length() as usize,
+                },
+                Kind::Char => Schema::Char {
+                    id,
+                    length: raw_type.maximum_length() as usize,
+                },
             };
             roots.push(next_type.clone());
             all.push(next_type);
@@ -196,9 +220,9 @@ impl<F: Read+Seek> ORCFile<F> {
         all.reverse();
         // I don't see this in the standard but Hive seems to keep everything under one root Struct
         match roots.pop() {
-            Some(Schema::Struct{fields, ..}) => Ok((fields, all)),
+            Some(Schema::Struct { fields, .. }) => Ok((fields, all)),
             None => Err(OrcError::SchemaError("Top level schema is empty")),
-            _ => Err(OrcError::SchemaError("Top level schema was not a struct"))
+            _ => Err(OrcError::SchemaError("Top level schema was not a struct")),
         }
     }
 
@@ -208,7 +232,6 @@ impl<F: Read+Seek> ORCFile<F> {
     pub fn schema(&self) -> &[(String, Schema)] {
         &self.schema
     }
-
 
     /// Get a reference to all columns and their descendants
     ///
@@ -224,7 +247,7 @@ impl<F: Read+Seek> ORCFile<F> {
     /// to the original file (to make ownership with threads easier)
     pub fn stripe(&mut self, stripe_id: usize) -> OrcResult<Stripe> {
         if stripe_id < self.footer.stripes.len() {
-            Stripe::new(stripe_id,self)
+            Stripe::new(stripe_id, self)
         } else {
             Err(OrcError::NoSuchStripe(stripe_id))
         }
@@ -236,9 +259,11 @@ impl<F: Read+Seek> ORCFile<F> {
     }
 
     /// Consume the file, iterating over all stripes, yielding dataframes
-    pub fn dataframes(mut self) -> impl Iterator<Item=OrcResult<DataFrame>> {
-        (0..self.stripe_count())
-        .map(move |stripe_id: usize| self.stripe(stripe_id).and_then(|st| st.dataframe(&mut self)))
+    pub fn dataframes(mut self) -> impl Iterator<Item = OrcResult<DataFrame>> {
+        (0..self.stripe_count()).map(move |stripe_id: usize| {
+            self.stripe(stripe_id)
+                .and_then(|st| st.dataframe(&mut self))
+        })
     }
 }
 
@@ -263,8 +288,7 @@ pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
     match byt.last() {
         None => Err(OrcError::TruncatedError("ORC file is empty")),
         Some(&length) => {
-            let postscript_bytes = &byt[
-                byt.len() - length as usize - 1 .. byt.len()-1];
+            let postscript_bytes = &byt[byt.len() - length as usize - 1..byt.len() - 1];
             Ok(messages::PostScript::decode(postscript_bytes)?)
         }
     }
@@ -276,18 +300,17 @@ pub struct Stripe {
     pub(crate) info: messages::StripeInformation,
     pub(crate) footer: messages::StripeFooter,
     pub(crate) flat_schema: Vec<Schema>,
-    pub(crate) streams: HashMap<(u32, messages::stream::Kind), std::ops::Range<u64>>
+    pub(crate) streams: HashMap<(u32, messages::stream::Kind), std::ops::Range<u64>>,
 }
 impl Stripe {
     /// Create a stripe from StripeInformation and a StripeFooter
     ///
     /// The StripeFooter is read from the parent file
-    pub(crate) fn new<F: Read+Seek>(id: usize, file: &mut ORCFile<F>) -> OrcResult<Self> {
+    pub(crate) fn new<F: Read + Seek>(id: usize, file: &mut ORCFile<F>) -> OrcResult<Self> {
         let info = file.footer.stripes[id].clone();
         let footer: messages::StripeFooter = file.read_message(
             info.offset() + info.index_length() + info.data_length()
-            .. 
-            info.offset() + info.index_length() + info.data_length() + info.footer_length()
+                ..info.offset() + info.index_length() + info.data_length() + info.footer_length(),
         )?;
         // Columns may need to search for several streams, and there may be many columns
         // So save some compute by indexing it.
@@ -305,7 +328,7 @@ impl Stripe {
             info,
             footer,
             flat_schema: file.flat_schema().to_vec(),
-            streams
+            streams,
         })
     }
 
@@ -321,22 +344,24 @@ impl Stripe {
     /// Panics if the ORC file doesn't have a top-level struct
     pub fn cols(&self) -> usize {
         match &self.flat_schema[0] {
-            Schema::Struct{fields, ..} => fields.len(),
-            _ => panic!("This non-standard ORC doesn't have a top level schema.")
+            Schema::Struct { fields, .. } => fields.len(),
+            _ => panic!("This non-standard ORC doesn't have a top level schema."),
         }
     }
 
     /// Read and return one column from the stripe
-    pub fn column<F: Read+Seek>(&self, id: usize, toc: &mut ORCFile<F>) -> OrcResult<Column> {
+    pub fn column<F: Read + Seek>(&self, id: usize, toc: &mut ORCFile<F>) -> OrcResult<Column> {
         if self.footer.columns.len() != self.flat_schema.len() {
-            return Err(OrcError::SchemaError("Stripe column definitions don't match schema"))
+            return Err(OrcError::SchemaError(
+                "Stripe column definitions don't match schema",
+            ));
         }
         Column::new(
             self,
-            &self.flat_schema[id], 
-            &self.footer.columns[id], 
+            &self.flat_schema[id],
+            &self.footer.columns[id],
             &self.streams,
-            toc
+            toc,
         )
     }
 
@@ -344,20 +369,29 @@ impl Stripe {
     pub fn dataframe<F: Read + Seek>(&self, toc: &mut ORCFile<F>) -> OrcResult<DataFrame> {
         let mut columns = HashMap::new();
         let mut column_order = vec![];
-        if let Schema::Struct{fields, ..} = &self.flat_schema[0] {
+        if let Schema::Struct { fields, .. } = &self.flat_schema[0] {
             for (name, field) in fields {
                 column_order.push(name.clone());
-                columns.insert(name.clone(), Column::new(
-                    self,
-                    &self.flat_schema[field.id()], 
-                    &self.footer.columns[field.id()], 
-                    &self.streams,
-                    toc
-                )?);
+                columns.insert(
+                    name.clone(),
+                    Column::new(
+                        self,
+                        &self.flat_schema[field.id()],
+                        &self.footer.columns[field.id()],
+                        &self.streams,
+                        toc,
+                    )?,
+                );
             }
-            Ok(DataFrame {column_order, columns, length: self.rows() })
+            Ok(DataFrame {
+                column_order,
+                columns,
+                length: self.rows(),
+            })
         } else {
-            panic!("This non-standard ORC doesn't have a top level schema. Can't create a dataframe.")
+            panic!(
+                "This non-standard ORC doesn't have a top level schema. Can't create a dataframe."
+            )
         }
     }
 }

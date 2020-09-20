@@ -1,66 +1,106 @@
-use std::collections::HashMap;
-use std::io::{BufRead, Read, Seek};
+use crate::codecs;
+use crate::errors::*;
+use crate::messages;
+use crate::toc::{ORCFile, Stripe};
 use bytes::Bytes;
 use serde_json as json;
-use crate::codecs;
-use crate::toc::{ORCFile, Stripe};
-use crate::messages;
-use crate::errors::*;
+use std::collections::HashMap;
+use std::io::{BufRead, Read, Seek};
 
 /// Table Schema
 ///
 /// ORC has a relatively rich type system and supports nested types.
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum Schema {
-    Boolean {id: usize},
-    Byte {id: usize},
-    Short {id: usize},
-    Int {id: usize},
-    Long {id: usize},
-    Float {id: usize},
-    Double {id: usize},
-    String {id: usize},
-    Binary {id: usize},
-    Timestamp {id: usize},
+    Boolean {
+        id: usize,
+    },
+    Byte {
+        id: usize,
+    },
+    Short {
+        id: usize,
+    },
+    Int {
+        id: usize,
+    },
+    Long {
+        id: usize,
+    },
+    Float {
+        id: usize,
+    },
+    Double {
+        id: usize,
+    },
+    String {
+        id: usize,
+    },
+    Binary {
+        id: usize,
+    },
+    Timestamp {
+        id: usize,
+    },
     // TODO: Why is there a second timestamp type named TimestampInstant?
-    List {id: usize, inner: Box<Schema> },
+    List {
+        id: usize,
+        inner: Box<Schema>,
+    },
     /// Maps store keys and values
-    Map {id: usize, key: Box<Schema>, value: Box<Schema> },
+    Map {
+        id: usize,
+        key: Box<Schema>,
+        value: Box<Schema>,
+    },
     /// Nested structures are available, with named keys
-    Struct {id: usize, fields: Vec<(String, Schema)> },
+    Struct {
+        id: usize,
+        fields: Vec<(String, Schema)>,
+    },
     /// Hive support for Union is spotty, and we don't support it.
-    Union{id: usize},
-    Decimal{
+    Union {
+        id: usize,
+    },
+    Decimal {
         id: usize,
         precision: usize,
-        scale: usize
+        scale: usize,
     },
-    Date {id: usize},
-    Varchar {id: usize, length: usize},
-    Char {id: usize, length: usize}
+    Date {
+        id: usize,
+    },
+    Varchar {
+        id: usize,
+        length: usize,
+    },
+    Char {
+        id: usize,
+        length: usize,
+    },
 }
 impl Schema {
     /// Get the column ID of any type
     pub fn id(&self) -> usize {
         match self {
-            Self::Boolean{id}
-            | Self::Byte{id}
-            | Self::Short{id}
-            | Self::Int{id}
-            | Self::Long{id}
-            | Self::Float{id}
-            | Self::Double{id}
-            | Self::String{id}
-            | Self::Binary{id}
-            | Self::Timestamp{id}
-            | Self::List{id, ..}
-            | Self::Map{id, ..}
-            | Self::Struct{id, ..}
-            | Self::Union{id}
-            | Self::Decimal{id, ..}
-            | Self::Date{id}
-            | Self::Varchar{id, ..}
-            | Self::Char{id, ..} => *id
+            Self::Boolean { id }
+            | Self::Byte { id }
+            | Self::Short { id }
+            | Self::Int { id }
+            | Self::Long { id }
+            | Self::Float { id }
+            | Self::Double { id }
+            | Self::String { id }
+            | Self::Binary { id }
+            | Self::Timestamp { id }
+            | Self::List { id, .. }
+            | Self::Map { id, .. }
+            | Self::Struct { id, .. }
+            | Self::Union { id }
+            | Self::Decimal { id, .. }
+            | Self::Date { id }
+            | Self::Varchar { id, .. }
+            | Self::Char { id, .. } => *id,
         }
     }
 }
@@ -75,152 +115,213 @@ impl Schema {
 /// Similarly, the overhead of `Option<X>` may outweigh the target computation.
 #[derive(Debug, PartialEq)]
 pub enum Column {
-    Boolean {present: Option<Vec<bool>>, data: Vec<bool>},
-    Byte {present: Option<Vec<bool>>, data: Vec<u8>},
-    Int {present: Option<Vec<bool>>, data: Vec<i128>},
-    Float {present: Option<Vec<bool>>, data: Vec<f32>},
-    Double {present: Option<Vec<bool>>, data: Vec<f64>},
-    
+    Boolean {
+        present: Option<Vec<bool>>,
+        data: Vec<bool>,
+    },
+    Byte {
+        present: Option<Vec<bool>>,
+        data: Vec<u8>,
+    },
+    Int {
+        present: Option<Vec<bool>>,
+        data: Vec<i128>,
+    },
+    Float {
+        present: Option<Vec<bool>>,
+        data: Vec<f32>,
+    },
+    Double {
+        present: Option<Vec<bool>>,
+        data: Vec<f64>,
+    },
+
     /// A vector of strings, stored as a concatenated 1D array, and an array of lengths  
-    Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>, utf8: bool},
+    Blob {
+        present: Option<Vec<bool>>,
+        data: Vec<u8>,
+        length: Vec<u128>,
+        utf8: bool,
+    },
     /// A vector of blobs from a fixed set, stored as three arrays
     /// * A dictionary, stored like the usual blob vector:
     ///   * The set of distinct blobs, concatenated
     ///   * The lengths of each distinct blob
     /// * Encoded values:
     ///   * For each cell, the index of the corresponding blob in the dictionary
-    BlobDict { present: Option<Vec<bool>>, data: Vec<u128>, dictionary_data: Vec<u8>, length: Vec<u128>, utf8: bool },
+    BlobDict {
+        present: Option<Vec<bool>>,
+        data: Vec<u128>,
+        dictionary_data: Vec<u8>,
+        length: Vec<u128>,
+        utf8: bool,
+    },
 
-    /// For maps and lists, the data is the length.
-    Container {present: Option<Vec<bool>>, length: Vec<u128>},
+    /// A list, like a blob, is a length vector and a concatenated array of elements
+    List {
+        present: Option<Vec<bool>>,
+        length: Vec<u128>,
+        elements: Box<Column>,
+    },
+    /// A map is like two aligned List columns
+    Map {
+        present: Option<Vec<bool>>,
+        length: Vec<u128>,
+        keys: Box<Column>,
+        values: Box<Column>,
+    },
+
     /// Decimals, which store i128's with an associated scale.
-    Decimal {present: Option<Vec<bool>>, data: Vec<i128>, scale: Vec<i128> },
+    Decimal {
+        present: Option<Vec<bool>>,
+        data: Vec<i128>,
+        scale: Vec<i128>,
+    },
     /// Timestamps, which store time since 1970, plus a second stream with nanoseconds
-    Timestamp {present: Option<Vec<bool>>, seconds: Vec<i128>, nanos: Vec<u128> },
+    Timestamp {
+        present: Option<Vec<bool>>,
+        seconds: Vec<i128>,
+        nanos: Vec<u128>,
+    },
     /// Structs only store if they are present. The rest is in other columns.
-    Struct {present: Option<Vec<bool>>},
+    Struct { present: Option<Vec<bool>> },
     // Unions are not supported.
 }
 
 impl Column {
-    pub fn new<F: Read+Seek>(
+    pub fn new<F: Read + Seek>(
         stripe: &Stripe,
         schema: &Schema,
         enc: &messages::ColumnEncoding,
         streams: &HashMap<(u32, messages::stream::Kind), std::ops::Range<u64>>,
-        orc: &mut ORCFile<F>
+        orc: &mut ORCFile<F>,
     ) -> OrcResult<Column> {
         use messages::column_encoding::Kind as Ckind;
         use messages::stream::Kind as Skind;
-        let mut slice_by_kind = |sk: Skind| streams
-            .get(&(schema.id() as u32, sk))
-            .cloned()
-            .ok_or(OrcError::EncodingError(format!("Column {} missing {:?} stream", schema.id(), sk)))
-            .and_then(|rng| orc.read_compressed(
-                stripe.info.offset() + rng.start
-                .. stripe.info.offset() + rng.end
-            ));
+        let mut slice_by_kind = |sk: Skind| {
+            streams
+                .get(&(schema.id() as u32, sk))
+                .cloned()
+                .ok_or(OrcError::EncodingError(format!(
+                    "Column {} missing {:?} stream",
+                    schema.id(),
+                    sk
+                )))
+                .and_then(|rng| {
+                    orc.read_compressed(
+                        stripe.info.offset() + rng.start..stripe.info.offset() + rng.end,
+                    )
+                })
+        };
         // Most colspecs need these streams, so tee them up to save writing
         let data = slice_by_kind(Skind::Data);
         let len = slice_by_kind(Skind::Length);
         let present = slice_by_kind(Skind::Present)
-                .and_then(|r| codecs::BooleanRLEDecoder::from(&r[..])
-                    .collect::<OrcResult<Vec<bool>>>())
-                .ok();
+            .and_then(|r| codecs::BooleanRLEDecoder::from(&r[..]).collect::<OrcResult<Vec<bool>>>())
+            .ok();
 
         // These integer encodings are mostly orthogonal to the types
         let int_enc = |rs: Bytes| match enc.kind() {
-            Ckind::Direct | Ckind::Dictionary => codecs::RLE1::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>(),
-            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::RLE2::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>()
+            Ckind::Direct | Ckind::Dictionary => {
+                codecs::RLE1::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>()
+            }
+            Ckind::DirectV2 | Ckind::DictionaryV2 => {
+                codecs::RLE2::<i128>::from(&rs[..]).collect::<OrcResult<Vec<i128>>>()
+            }
         };
         let uint_enc = |rs: Bytes| match enc.kind() {
-            Ckind::Direct | Ckind::Dictionary => codecs::RLE1::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>(),
-            Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::RLE2::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>()
+            Ckind::Direct | Ckind::Dictionary => {
+                codecs::RLE1::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>()
+            }
+            Ckind::DirectV2 | Ckind::DictionaryV2 => {
+                codecs::RLE2::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>()
+            }
         };
         let content = match schema {
             // Boolean has it's own decoder
-            Schema::Boolean{..} => Column::Boolean{
+            Schema::Boolean { .. } => Column::Boolean {
                 present,
                 data: codecs::BooleanRLEDecoder::from(&data?[..])
-                // Booleans need to be trimmed because they round up to the nearest 8
-                .take(stripe.info.number_of_rows() as usize)
-                .collect::<OrcResult<_>>()?
+                    // Booleans need to be trimmed because they round up to the nearest 8
+                    .take(stripe.info.number_of_rows() as usize)
+                    .collect::<OrcResult<_>>()?,
             },
 
             // Byte has it's own decoder
-            Schema::Byte{..}   => Column::Byte{
+            Schema::Byte { .. } => Column::Byte {
                 present,
-                data: codecs::ByteRLEDecoder::from(&data?[..])
-                .collect::<OrcResult<_>>()?
+                data: codecs::ByteRLEDecoder::from(&data?[..]).collect::<OrcResult<_>>()?,
             },
 
             // All the integers work the same
             // We promote them all to i128 for simplicity as a POC
             // TODO: Specialize the integers
-            Schema::Short{..}
-            | Schema::Int{..}
-            | Schema::Long{..}
-            | Schema::Date{..} => Column::Int{present, data: int_enc(data?)?},
-            
-            // Float32, which has it's own decoder (the bit length is part of the encoder)
-            Schema::Float{..}  => Column::Float{
+            Schema::Short { .. }
+            | Schema::Int { .. }
+            | Schema::Long { .. }
+            | Schema::Date { .. } => Column::Int {
                 present,
-                data: codecs::FloatDecoder::from(&data?[..])
-                .collect::<OrcResult<_>>()?
+                data: int_enc(data?)?,
+            },
+
+            // Float32, which has it's own decoder (the bit length is part of the encoder)
+            Schema::Float { .. } => Column::Float {
+                present,
+                data: codecs::FloatDecoder::from(&data?[..]).collect::<OrcResult<_>>()?,
             },
 
             // Float64 has it's own decoder too
-            Schema::Double{..}  => Column::Double{
+            Schema::Double { .. } => Column::Double {
                 present,
-                data: codecs::DoubleDecoder::from(&data?[..])
-                .collect::<OrcResult<_>>()?
+                data: codecs::DoubleDecoder::from(&data?[..]).collect::<OrcResult<_>>()?,
             },
 
             // Decimals are huge ints with a scale, really just a knockoff IEEE754 again
-            Schema::Decimal{..} => Column::Decimal{
+            Schema::Decimal { .. } => Column::Decimal {
                 present,
                 data: int_enc(data?)?,
-                scale: int_enc(slice_by_kind(Skind::Secondary)?)?
+                scale: int_enc(slice_by_kind(Skind::Secondary)?)?,
             },
 
             // There are eight flavors of blob columns made from three binary choices:
             // * With and without encoding (with=string, without=blob)
             // * With RLE1 and RLE2 (int_enc handles that for us)
             // * Stored or Dictionary-compresses
-            Schema::Binary{..}
-            | Schema::String{..}
-            | Schema::Varchar{..}
-            | Schema::Char{..} => {
+            Schema::Binary { .. }
+            | Schema::String { .. }
+            | Schema::Varchar { .. }
+            | Schema::Char { .. } => {
                 // We don't do any decoding here but just wait until someone uses it.
                 // So all we need to know is whether it will need to be done later.
-                let utf8 = if let Schema::Binary{..} = schema {
+                let utf8 = if let Schema::Binary { .. } = schema {
                     false
                 } else {
                     true
                 };
                 // Similarly, the dictionary decoding is not done until later
                 // But it will require two different enums
-                match enc.kind() { 
-                    Ckind::Direct | Ckind::DirectV2 => Column::Blob{
+                match enc.kind() {
+                    Ckind::Direct | Ckind::DirectV2 => Column::Blob {
                         present,
-                        data:data?.to_vec(),
+                        data: data?.to_vec(),
                         length: uint_enc(len?)?,
-                        utf8
+                        utf8,
                     },
-                    Ckind::Dictionary | Ckind::DictionaryV2 => Column::BlobDict{
+                    Ckind::Dictionary | Ckind::DictionaryV2 => Column::BlobDict {
                         present,
                         data: uint_enc(data?)?,
                         dictionary_data: slice_by_kind(Skind::Secondary)?.to_vec(),
                         length: uint_enc(len?)?,
-                        utf8
+                        utf8,
                     },
                 }
-                
+            }
+            Schema::Map { .. } | Schema::List { .. } => Column::Container {
+                present,
+                length: uint_enc(len?)?,
             },
-            Schema::Map{..}
-            | Schema::List{..} => Column::Container{present, length: uint_enc(len?)?},
-            Schema::Struct{..} => Column::Struct{present},
-            Schema::Timestamp{..} => {
+            Schema::Struct { .. } => Column::Struct { present },
+            Schema::Timestamp { .. } => {
                 // It could look something like this:
                 // ColumnContent::Timestamp{
                 //     seconds: int_enc(data?),
@@ -231,29 +332,31 @@ impl Column {
                 //     }
                 // }
                 todo!("Timestamp decoding is not supported yet for Column decoding")
-            },
-            Schema::Union{..} => return Err(OrcError::SchemaError("Union types are not supported")),
+            }
+            Schema::Union { .. } => {
+                return Err(OrcError::SchemaError("Union types are not supported"))
+            }
         };
         Ok(content)
     }
 
     /// A stream indicating whether the row is non-null
-    /// 
+    ///
     /// If it's empty (e.g. None, not length 0) then all rows are present.
     /// Keep in mind it's frequently the case all rows are present so expect None
     pub fn present(&self) -> &Option<Vec<bool>> {
         match self {
-            Self::Boolean {present, ..}
-            | Self::Byte {present, ..}
-            | Self::Int {present, ..}
-            | Self::Float {present, ..}
-            | Self::Double {present, ..}
-            | Self::Blob {present, ..}
-            | Self::BlobDict {present, ..}
-            | Self::Container {present, ..}
-            | Self::Decimal {present, ..}
-            | Self::Timestamp {present, ..}
-            | Self::Struct {present} => present
+            Self::Boolean { present, .. }
+            | Self::Byte { present, .. }
+            | Self::Int { present, .. }
+            | Self::Float { present, .. }
+            | Self::Double { present, .. }
+            | Self::Blob { present, .. }
+            | Self::BlobDict { present, .. }
+            | Self::Container { present, .. }
+            | Self::Decimal { present, .. }
+            | Self::Timestamp { present, .. }
+            | Self::Struct { present } => present,
         }
     }
 
@@ -263,12 +366,13 @@ impl Column {
     ///    In: The content of the input vector (maybe a JSON Value)
     ///    Out: The output of the transformation function (Maybe a primitive type like i64)
     ///    F: The function you're trying to cast with
-    fn coerce_to_arrow_vecs<In, Out, F: Fn(&In) -> Option<Out>>(items: &[In], tran: F) -> (Option<Vec<bool>>, Vec<Out>) {
+    fn coerce_to_arrow_vecs<In, Out, F: Fn(&In) -> Option<Out>>(
+        items: &[In],
+        tran: F,
+    ) -> (Option<Vec<bool>>, Vec<Out>) {
         // The present stream just records nulls separately from the data stream, easy.
-        let coerced : Vec<_> = items.iter()
-            .map(tran)
-            .collect();
-        let present: Vec<bool> = coerced.iter().map(|it| it.is_some() ).collect();
+        let coerced: Vec<_> = items.iter().map(tran).collect();
+        let present: Vec<bool> = coerced.iter().map(|it| it.is_some()).collect();
         let present = if present.iter().all(|x| *x) {
             None
         } else {
@@ -283,22 +387,29 @@ impl Column {
     ///    In: The content of the input vector (maybe a JSON Value)
     ///    Out: The output of the transformation function (Maybe a primitive type like i64)
     ///    F: The function you're trying to cast with
-    fn coerce_to_opt_vecs<In, Out, F: Fn(&In) -> Option<Out>>(present: &Option<Vec<bool>>, items: &[In], tran: F) -> Vec<Option<Out>> {
+    fn coerce_to_opt_vecs<In, Out, F: Fn(&In) -> Option<Out>>(
+        present: &Option<Vec<bool>>,
+        items: &[In],
+        tran: F,
+    ) -> Vec<Option<Out>> {
         // If the present stream is Some(_) then it's length is the length of this stream.
         // If present is None, then items length is the length of this stream.
         match present {
             Some(ref present_vec) => {
                 let mut item_idx = 0;
-                present_vec.iter().map(|&p| {
-                    if p && item_idx < items.len() {
-                        item_idx += 1;
-                        tran(&items[item_idx-1])
-                    } else {
-                        None
-                    }
-                }).collect()
-            },
-            None => items.iter().map(tran).collect()
+                present_vec
+                    .iter()
+                    .map(|&p| {
+                        if p && item_idx < items.len() {
+                            item_idx += 1;
+                            tran(&items[item_idx - 1])
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            None => items.iter().map(tran).collect(),
         }
     }
 
@@ -318,7 +429,7 @@ impl Column {
     pub fn from_json(items: &[json::Value]) -> Self {
         let type_guess = items
             .iter()
-            .filter(|it| !it.is_null() )
+            .filter(|it| !it.is_null())
             .next()
             .cloned()
             .unwrap_or(json::Value::Bool(false));
@@ -326,7 +437,8 @@ impl Column {
             let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_bool());
             Column::Boolean { present, data }
         } else if type_guess.is_i64() {
-            let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_i64().map(|x| x as i128));
+            let (present, data) =
+                Self::coerce_to_arrow_vecs(items, |j| j.as_i64().map(|x| x as i128));
             Column::Int { present, data }
         } else if type_guess.is_f64() {
             let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_f64());
@@ -342,16 +454,16 @@ impl Column {
     /// * Type conversion failures will result in None for that element.
     pub fn to_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<Option<N>>> {
         match self {
-            Column::Int{present, data} => Some(
-                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
-            ),
-            Column::Float{present, data} => Some(
-                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
-            ),
-            Column::Double{present, data} => Some(
-                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
-            ),
-            _ => None
+            Column::Int { present, data } => {
+                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            Column::Float { present, data } => {
+                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            Column::Double { present, data } => {
+                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            _ => None,
         }
     }
 
@@ -367,27 +479,30 @@ impl Column {
             return None;
         }
         match self {
-            Column::Int{data, ..} =>
-                data.iter().map(|x| N::from(*x)).collect(),
-            Column::Float{data, ..} =>
-                data.iter().map(|x| N::from(*x)).collect(),
-            Column::Double{data, ..} =>
-                data.iter().map(|x| N::from(*x)).collect(),
-            _ => None
+            Column::Int { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
+            Column::Float { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
+            Column::Double { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
+            _ => None,
         }
     }
 
     /// Split a concatenated array of blobs into a vector of optional slices
     ///
-    /// This is used by as_byte_slices to handle the common parts of direct and dictionary encoding 
-    fn split_nullible_byte_stream<'t> (present: &Option<Vec<bool>>, length: &Vec<u128>, data: &'t Vec<u8>) -> Vec<Option<&'t [u8]>> {
+    /// This is used by as_byte_slices to handle the common parts of direct and dictionary encoding
+    fn split_nullible_byte_stream<'t>(
+        present: &Option<Vec<bool>>,
+        length: &Vec<u128>,
+        data: &'t Vec<u8>,
+    ) -> Vec<Option<&'t [u8]>> {
         let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
         let mut blobs: Vec<Option<&[u8]>> = vec![];
         let mut byte_cursor = 0; // Where are we in the concatenated string
         for blob_ix in 0..blob_count {
-            if blobs.len() < length.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+            if blobs.len() < length.len()
+                && (present.is_none() || present.as_ref().unwrap()[blob_ix])
+            {
                 let blob_len = length[blobs.len()] as usize;
-                blobs.push(Some(&data[byte_cursor..byte_cursor+blob_len]));
+                blobs.push(Some(&data[byte_cursor..byte_cursor + blob_len]));
                 byte_cursor += blob_len;
             } else {
                 blobs.push(None);
@@ -402,9 +517,19 @@ impl Column {
     /// which are also aliased as Char and Varchar.
     pub fn as_byte_slices(&self) -> Option<Vec<Option<&[u8]>>> {
         match self {
-            Column::Blob{length, data, present, ..} =>
-                Some(Self::split_nullible_byte_stream(present, length, data)),
-            Column::BlobDict{length, data, present, dictionary_data, ..} => {
+            Column::Blob {
+                length,
+                data,
+                present,
+                ..
+            } => Some(Self::split_nullible_byte_stream(present, length, data)),
+            Column::BlobDict {
+                length,
+                data,
+                present,
+                dictionary_data,
+                ..
+            } => {
                 // First the dictionary is read like a standard string column
                 let dictionary = Self::split_nullible_byte_stream(&None, length, dictionary_data);
 
@@ -412,15 +537,17 @@ impl Column {
                 let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(data.len());
                 let mut blobs: Vec<Option<&[u8]>> = vec![];
                 for blob_ix in 0..blob_count {
-                    if blobs.len() < data.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+                    if blobs.len() < data.len()
+                        && (present.is_none() || present.as_ref().unwrap()[blob_ix])
+                    {
                         blobs.push(dictionary[blobs.len()]);
                     } else {
                         blobs.push(None);
                     }
                 }
                 Some(blobs)
-            },
-            _ => None // These are not blobs
+            }
+            _ => None, // These are not blobs
         }
     }
 
@@ -428,18 +555,20 @@ impl Column {
     ///
     /// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
     pub fn to_vecs(&self) -> Option<Vec<Option<Vec<u8>>>> {
-        Some(self.as_byte_slices()?
-            .into_iter()
-            .map(|opt_slc| Some(opt_slc?.to_vec()))
-            .collect())
+        Some(
+            self.as_byte_slices()?
+                .into_iter()
+                .map(|opt_slc| Some(opt_slc?.to_vec()))
+                .collect(),
+        )
     }
 
     /// Convert the column to a vector of str, if possible.
     ///
     /// * This doesn't allocate but may still be fairly slow since it does check utf8 validity.
     /// * Since ORC requires UTF8 for strings, errors are unlikely unless you read blobs as strings.  
-    /// * This is intended as a 
-    /// * If you need more speed, and you're sure you have only utf8, 
+    /// * This is intended as a
+    /// * If you need more speed, and you're sure you have only utf8,
     ///     consider using `as_byte_slices()` with `from_utf8_unchecked()`.
     /// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
     pub fn as_strs(&self) -> OrcResult<Option<Vec<Option<&str>>>> {
@@ -454,7 +583,7 @@ impl Column {
                     col.push(match row {
                         None => None,
                         // Any failing string will halt decoding the column
-                        Some(slc) => Some(std::str::from_utf8(slc)?)
+                        Some(slc) => Some(std::str::from_utf8(slc)?),
                     });
                 }
                 Ok(Some(col))
@@ -467,13 +596,14 @@ impl Column {
     /// This is based on `as_strs()` and inherits its tradeoffs.
     /// It will likely be slowe though, because it introduces a lot of allocation.
     pub fn to_strings(&self) -> OrcResult<Option<Vec<Option<String>>>> {
-        self.as_strs().map(|op_vec_op|
-            op_vec_op.map(|vec_op|
-                vec_op.into_iter().map(|op|
-                    op.map(|s| s.to_owned())
-                ).collect()
-            )
-        )
+        self.as_strs().map(|op_vec_op| {
+            op_vec_op.map(|vec_op| {
+                vec_op
+                    .into_iter()
+                    .map(|op| op.map(|s| s.to_owned()))
+                    .collect()
+            })
+        })
     }
 }
 // TODO: Write this more compactly
@@ -481,20 +611,23 @@ macro_rules! basic_column_from_vec {
     ($prim:ty, $constructor:path) => {
         impl From<Vec<$prim>> for Column {
             fn from(data: Vec<$prim>) -> Self {
-                $constructor { present: None, data }
+                $constructor {
+                    present: None,
+                    data,
+                }
             }
         }
         impl From<Vec<Option<$prim>>> for Column {
             fn from(data: Vec<Option<$prim>>) -> Self {
-                let (present, data) = Column::coerce_to_arrow_vecs(&data, |d| d.map(|x| x.clone().into()));
+                let (present, data) =
+                    Column::coerce_to_arrow_vecs(&data, |d| d.map(|x| x.clone().into()));
                 $constructor { present, data }
             }
         }
-    }
+    };
 }
 basic_column_from_vec!(bool, Column::Boolean);
 basic_column_from_vec!(i128, Column::Int);
-
 
 /// An ordered set of columns; a deserialized stripe or file
 ///
@@ -503,7 +636,7 @@ basic_column_from_vec!(i128, Column::Int);
 pub struct DataFrame {
     pub column_order: Vec<String>,
     pub columns: HashMap<String, Column>,
-    pub length: usize
+    pub length: usize,
 }
 impl DataFrame {
     /// Read a dataframe from newline separated JSON records. Column order is not preserved.
@@ -528,14 +661,17 @@ impl DataFrame {
             for (name, column) in &mut frame {
                 match row.remove(name) {
                     Some(cell) => column.push(cell),
-                    None => column.push(json::Value::Null)
+                    None => column.push(json::Value::Null),
                 }
             }
         }
         Ok(DataFrame {
             column_order: frame.keys().cloned().collect(),
             length: frame.values().next().map(|c| c.len()).unwrap_or(0),
-            columns: frame.into_iter().map(|(k, v)| (k, Column::from_json(&v))).collect()
+            columns: frame
+                .into_iter()
+                .map(|(k, v)| (k, Column::from_json(&v)))
+                .collect(),
         })
     }
 }
@@ -549,20 +685,20 @@ mod tests {
         let items = &[json!(true), json!(false), json!(null), json!("foo")];
         let (present, data) = Column::coerce_to_arrow_vecs(items, |j| j.as_bool());
         assert_eq!(present, Some(vec![true, true, false, false]));
-        assert_eq!(data , vec![true, false]);
+        assert_eq!(data, vec![true, false]);
 
         // All present
         let items = &[json!(true), json!(false)];
         let (present, data) = Column::coerce_to_arrow_vecs(items, |j| j.as_bool());
         assert_eq!(present, None);
-        assert_eq!(data , vec![true, false]);
+        assert_eq!(data, vec![true, false]);
     }
     #[test]
     fn column_from_json() {
         let orig = &[json!(1), json!(2), json!(3)];
         assert_eq!(
             Column::from_json(orig).to_all_numbers(),
-            Some(vec![1,2,3])
+            Some(vec![1, 2, 3])
         );
     }
 }

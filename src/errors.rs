@@ -21,7 +21,7 @@ pub enum OrcError {
     #[error("JSON deserialization error: {0}")]
     SerdeError(#[from] serde_json::Error),
     #[error("Corrupt UTF8 string: {0}")]
-    UTF8Error(#[from] std::str::Utf8Error)
+    UTF8Error(#[from] std::str::Utf8Error),
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;
