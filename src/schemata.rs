@@ -65,26 +65,32 @@ impl Schema {
     }
 }
 
-/// Composite types made from multiple streams.
+/// A vectors of nullable elements of various types.
 ///
-/// These are analogous to Arrow formats, but not quite - specifically these are mutable.
+/// Null elements are represented with a separate stream of boolean values.
+/// But unlike a mask, where the "present" stream is false, the corresponding element is omitted.
+/// Hence sparse vectors may have significant space savings.  
+/// Vectors with no nulls have the "present" stream omitted instead, also saving modest space.
+/// The downside is that most interesting operations require an additional copy to impute the nulls.
+/// Similarly, the overhead of `Option<X>` may outweigh the target computation.
 #[derive(Debug, PartialEq)]
 pub enum Column {
-    /// Boolean RLE
     Boolean {present: Option<Vec<bool>>, data: Vec<bool>},
-    /// RLE encoding for 8-bit integers and UNIONS. Unions aren't supported.
     Byte {present: Option<Vec<bool>>, data: Vec<u8>},
-    /// `DIRECT` encoding, for all int sizes, booleans, bytes, dates.
-    /// For dates, the data is the days since 1970.  
     Int {present: Option<Vec<bool>>, data: Vec<i128>},
-    /// `DIRECT` encoding for floats
     Float {present: Option<Vec<bool>>, data: Vec<f32>},
-    /// `DIRECT` encoding for floats
     Double {present: Option<Vec<bool>>, data: Vec<f64>},
-    /// `DIRECT` encoding for chars, strings, varchars, and blobs
-    String {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
-    /// `DIRECT` encoding for chars, strings, varchars, and blobs
-    Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
+    
+    /// A vector of strings, stored as a concatenated 1D array, and an array of lengths  
+    Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>, utf8: bool},
+    /// A vector of blobs from a fixed set, stored as three arrays
+    /// * A dictionary, stored like the usual blob vector:
+    ///   * The set of distinct blobs, concatenated
+    ///   * The lengths of each distinct blob
+    /// * Encoded values:
+    ///   * For each cell, the index of the corresponding blob in the dictionary
+    BlobDict { present: Option<Vec<bool>>, data: Vec<u128>, dictionary_data: Vec<u8>, length: Vec<u128>, utf8: bool },
+
     /// For maps and lists, the data is the length.
     Container {present: Option<Vec<bool>>, length: Vec<u128>},
     /// `DICTIONARY` encoding, only for chars, strings and varchars (not blobs)
@@ -134,6 +140,7 @@ impl Column {
             Ckind::DirectV2 | Ckind::DictionaryV2 => codecs::RLE2::<u128>::from(&rs[..]).collect::<OrcResult<Vec<u128>>>()
         };
         let content = match schema {
+            // Boolean has it's own decoder
             Schema::Boolean{..} => Column::Boolean{
                 present,
                 data: codecs::BooleanRLEDecoder::from(&data?[..])
@@ -141,40 +148,76 @@ impl Column {
                 .take(stripe.info.number_of_rows() as usize)
                 .collect::<OrcResult<_>>()?
             },
+
+            // Byte has it's own decoder
             Schema::Byte{..}   => Column::Byte{
                 present,
                 data: codecs::ByteRLEDecoder::from(&data?[..])
                 .collect::<OrcResult<_>>()?
             },
+
+            // All the integers work the same
+            // We promote them all to i128 for simplicity as a POC
+            // TODO: Specialize the integers
             Schema::Short{..}
             | Schema::Int{..}
             | Schema::Long{..}
             | Schema::Date{..} => Column::Int{present, data: int_enc(data?)?},
+            
+            // Float32, which has it's own decoder (the bit length is part of the encoder)
             Schema::Float{..}  => Column::Float{
                 present,
                 data: codecs::FloatDecoder::from(&data?[..])
                 .collect::<OrcResult<_>>()?
             },
+
+            // Float64 has it's own decoder too
             Schema::Double{..}  => Column::Double{
                 present,
                 data: codecs::DoubleDecoder::from(&data?[..])
                 .collect::<OrcResult<_>>()?
             },
+
+            // Decimals are huge ints with a scale, really just a knockoff IEEE754 again
             Schema::Decimal{..} => Column::Decimal{
                 present,
                 data: int_enc(data?)?,
                 scale: int_enc(slice_by_kind(Skind::Secondary)?)?
             },
-            Schema::Binary{..} => {
-                Column::Blob{present, data:data?.to_vec(), length: uint_enc(len?)?}
-            }
-            Schema::String{..}
+
+            // There are eight flavors of blob columns made from three binary choices:
+            // * With and without encoding (with=string, without=blob)
+            // * With RLE1 and RLE2 (int_enc handles that for us)
+            // * Stored or Dictionary-compresses
+            Schema::Binary{..}
+            | Schema::String{..}
             | Schema::Varchar{..}
-            | Schema::Char{..} => Column::Blob{
-                present,
-                data: codecs::ByteRLEDecoder::from(&data?[..])
-                    .collect::<OrcResult<_>>()?,
-                length: uint_enc(len?)?
+            | Schema::Char{..} => {
+                // We don't do any decoding here but just wait until someone uses it.
+                // So all we need to know is whether it will need to be done later.
+                let utf8 = if let Schema::Binary{..} = schema {
+                    false
+                } else {
+                    true
+                };
+                // Similarly, the dictionary decoding is not done until later
+                // But it will require two different enums
+                match enc.kind() { 
+                    Ckind::Direct | Ckind::DirectV2 => Column::Blob{
+                        present,
+                        data:data?.to_vec(),
+                        length: uint_enc(len?)?,
+                        utf8
+                    },
+                    Ckind::Dictionary | Ckind::DictionaryV2 => Column::BlobDict{
+                        present,
+                        data: uint_enc(data?)?,
+                        dictionary_data: slice_by_kind(Skind::Secondary)?.to_vec(),
+                        length: uint_enc(len?)?,
+                        utf8
+                    },
+                }
+                
             },
             Schema::Map{..}
             | Schema::List{..} => Column::Container{present, length: uint_enc(len?)?},
@@ -208,7 +251,7 @@ impl Column {
             | Self::Float {present, ..}
             | Self::Double {present, ..}
             | Self::Blob {present, ..}
-            | Self::String {present, ..}
+            | Self::BlobDict {present, ..}
             | Self::Container {present, ..}
             | Self::Dict {present, ..}
             | Self::Decimal {present, ..}
@@ -337,22 +380,43 @@ impl Column {
         }
     }
 
+    /// Split a concatenated array of blobs into a vector of optional slices
+    ///
+    /// This is used by as_byte_slices to handle the common parts of direct and dictionary encoding 
+    fn split_nullible_byte_stream<'t> (present: &Option<Vec<bool>>, length: &Vec<u128>, data: &'t Vec<u8>) -> Vec<Option<&'t [u8]>> {
+        let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
+        let mut blobs: Vec<Option<&[u8]>> = vec![];
+        let mut byte_cursor = 0; // Where are we in the concatenated string
+        for blob_ix in 0..blob_count {
+            if blobs.len() < length.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+                let blob_len = length[blobs.len()] as usize;
+                blobs.push(Some(&data[byte_cursor..byte_cursor+blob_len]));
+                byte_cursor += blob_len;
+            } else {
+                blobs.push(None);
+            }
+        }
+        blobs
+    }
+
     /// View the column as a vector of byte slices, if it's possible.
     ///
     /// This is supported only for Blob columns, and for String columns
     /// which are also aliased as Char and Varchar.
     pub fn as_byte_slices(&self) -> Option<Vec<Option<&[u8]>>> {
         match self {
-            Column::Blob{length, data, present}
-            | Column::String{length, data, present} => {
-                let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
+            Column::Blob{length, data, present, ..} =>
+                Some(Self::split_nullible_byte_stream(present, length, data)),
+            Column::BlobDict{length, data, present, dictionary_data, ..} => {
+                // First the dictionary is read like a standard string column
+                let dictionary = Self::split_nullible_byte_stream(&None, length, dictionary_data);
+
+                // Then we decompress the rest using the dictionary
+                let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(data.len());
                 let mut blobs: Vec<Option<&[u8]>> = vec![];
-                let mut byte_cursor = 0; // Where are we in the concatenated string
                 for blob_ix in 0..blob_count {
-                    if blobs.len() < length.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
-                        let blob_len = length[blobs.len()] as usize;
-                        blobs.push(Some(&data[byte_cursor..byte_cursor+blob_len]));
-                        byte_cursor += blob_len;
+                    if blobs.len() < data.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+                        blobs.push(dictionary[blobs.len()]);
                     } else {
                         blobs.push(None);
                     }
@@ -383,6 +447,8 @@ impl Column {
     /// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
     pub fn as_strs(&self) -> OrcResult<Option<Vec<Option<&str>>>> {
         // This is a tad longer because it's clearer (to me) how the error propagates
+        // TODO: We could avoid checking UTF8 for each string if it was dictionary compressed
+        // TODO: Should we allow decoding Blobs as strings? We do now because we don't check Column::Blob::utf8
         match self.as_byte_slices() {
             None => Ok(None),
             Some(slices) => {
