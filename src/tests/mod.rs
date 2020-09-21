@@ -241,9 +241,26 @@ fn go_read_metadata() {
     assert_eq!(toc.user_metadata(), hashmap! {"foo".into() => "bar".into()});
 }
 
+/// The simplest test - a tiny table. This one without using JSON.
 #[test]
 fn go_read_test1() {
     let orc_bytes = include_bytes!("examples/TestOrcFile.test1.orc");
     let ref mut toc = ORCFile::from_slice(&orc_bytes[..]).unwrap();
-    let column = toc.stripe(0).unwrap().dataframe(toc).unwrap();
+    let frame = toc.stripe(0).unwrap().dataframe(toc).unwrap();
+
+    assert_eq!(frame.columns["boolean1"].to_booleans(), Some(vec![Some(false), Some(true)]));
+    assert_eq!(frame.columns["byte1"].to_all_numbers(), Some(vec![1u8, 100]));
+    assert_eq!(frame.columns["short1"].to_all_numbers(), Some(vec![1024i16, 2048]));
+    assert_eq!(frame.columns["int1"].to_all_numbers(), Some(vec![65536i32, 65536]));
+    assert_eq!(frame.columns["long1"].to_all_numbers(), Some(vec![9223372036854775807i64, 9223372036854775807]));
+    assert_eq!(frame.columns["float1"].to_all_numbers(), Some(vec![1f32, 2.]));
+    assert_eq!(frame.columns["double1"].to_all_numbers(), Some(vec![-15f64, -5.]));
+    assert_eq!(frame.columns["bytes1"].as_byte_slices(), Some(vec![Some(&[0, 1, 2, 3, 4][..]), Some(&[])]));
+    assert_eq!(frame.columns["bytes1"].to_vecs(), Some(vec![Some(vec![0, 1, 2, 3, 4]), Some(vec![])]));
+    assert_eq!(frame.columns["string1"].as_strs().unwrap(), Some(vec![Some("hi"), Some("bye")]));
+    assert_eq!(frame.columns["string1"].to_strings().unwrap(), Some(vec![Some("hi".to_string()), Some("bye".to_string())]));
+    // TODO: column "middle" (a struct)
+    // TODO: column "list"
+    // TODO: column "map"
+
 }

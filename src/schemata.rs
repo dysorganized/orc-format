@@ -186,6 +186,7 @@ pub enum Column {
     /// Structs only store if they are present. The rest is in other columns.
     Struct { present: Option<Vec<bool>> },
     // Unions are not supported.
+    Unsupported(&'static str)
 }
 
 impl Column {
@@ -310,14 +311,14 @@ impl Column {
                     Ckind::Dictionary | Ckind::DictionaryV2 => Column::BlobDict {
                         present,
                         data: uint_enc(data?)?,
-                        dictionary_data: slice_by_kind(Skind::Secondary)?.to_vec(),
+                        dictionary_data: slice_by_kind(Skind::DictionaryData)?.to_vec(),
                         length: uint_enc(len?)?,
                         utf8,
                     },
                 }
             }
-            Schema::Map { .. } => todo!("Map columns are not supported yet."),
-            Schema::List { .. } => todo!("List columns are not supported yet."),
+            Schema::Map { .. } => Column::Unsupported("Map columns are not supported yet."),
+            Schema::List { .. } => Column::Unsupported("List columns are not supported yet."),
             Schema::Struct { .. } => Column::Struct { present },
             Schema::Timestamp { .. } => {
                 // It could look something like this:
@@ -329,11 +330,9 @@ impl Column {
                 //         _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
                 //     }
                 // }
-                todo!("Timestamp decoding is not supported yet for Column decoding")
+                Column::Unsupported("Timestamp decoding is not supported yet for Column decoding")
             }
-            Schema::Union { .. } => {
-                return Err(OrcError::SchemaError("Union types are not supported"))
-            }
+            Schema::Union { .. } => Column::Unsupported("Union columns are not well defined or supported")
         };
         Ok(content)
     }
@@ -356,6 +355,7 @@ impl Column {
             | Self::Decimal { present, .. }
             | Self::Timestamp { present, .. }
             | Self::Struct { present } => present,
+            Self::Unsupported(note) => unimplemented!("{}", note)
         }
     }
 
@@ -447,12 +447,25 @@ impl Column {
         }
     }
 
+    /// Convert to a vector of nullable booleans, if possible
+    pub fn to_booleans(&self) -> Option<Vec<Option<bool>>> {
+        match self {
+            Column::Boolean { present, data } => {
+                Some(Self::coerce_to_opt_vecs(present, data, |x| Some(*x)))
+            },
+            _ => None
+        }
+    }
+
     /// Convert to a vector of nullable integers, if possible
     ///
     /// * The exact type is inferred, or you can override it.
     /// * Type conversion failures will result in None for that element.
     pub fn to_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<Option<N>>> {
         match self {
+            Column::Byte { present, data } => {
+                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
             Column::Int { present, data } => {
                 Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
             }
@@ -478,6 +491,7 @@ impl Column {
             return None;
         }
         match self {
+            Column::Byte{ data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Int { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Float { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Double { data, .. } => data.iter().map(|x| N::from(*x)).collect(),

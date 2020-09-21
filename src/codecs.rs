@@ -132,7 +132,7 @@ impl<'t> Decoder<'t> for FloatDecoder<'t> {
         if self.buf.len() < 4 {
             Err(OrcError::EndOfStream)
         } else {
-            let f = f32::from_be_bytes(self.buf[..4].try_into().unwrap());
+            let f = f32::from_le_bytes(self.buf[..4].try_into().unwrap());
             self.buf = &self.buf[4..];
             Ok(f)
         }
@@ -159,7 +159,7 @@ impl<'t> Decoder<'t> for DoubleDecoder<'t> {
         if self.buf.len() < 8 {
             Err(OrcError::EndOfStream)
         } else {
-            let f = f64::from_be_bytes(self.buf[..8].try_into().unwrap());
+            let f = f64::from_le_bytes(self.buf[..8].try_into().unwrap());
             self.buf = &self.buf[8..];
             Ok(f)
         }
@@ -389,7 +389,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
 
     /// Start a patch, choosing a mode for interpreting the upcoming string
     fn get_mode(&mut self) -> OrcResult<()> {
-        if self.nib.is_end() {
+        if self.nib.is_final_byte() {
             return Err(OrcError::EndOfStream);
         }
         // The header can be 1, 2, or 4 bytes.
@@ -403,7 +403,7 @@ impl<'t, S: Sign> RLE2<'t, S> {
                 self.length = self.nib.read::<usize>(3, "RLE2 short repeat length")? + 3;
                 let elem = self.nib.read(self.width * 8, "RLE2 short repeat element")?;
 
-                self.mode = RLE2Mode::ShortRepeat(elem);
+                self.mode = RLE2Mode::ShortRepeat(S::unzigzag(elem));
             }
             1 => {
                 // The first two bytes look like EEWWWWWL LLLLLLLL
@@ -502,7 +502,7 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         self.length = self.length.saturating_sub(1);
         match self.mode {
             RLE2Mode::ShortRepeat(item) => Ok(item),
-            RLE2Mode::Direct => self.nib.read(self.width, "RLE2 direct encoded int"),
+            RLE2Mode::Direct => Ok(S::unzigzag(self.nib.read(self.width, "RLE2 direct encoded int")?)),
             RLE2Mode::PatchedBase {
                 base,
                 patch_width,
