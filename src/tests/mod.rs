@@ -253,28 +253,28 @@ fn go_read_test1() {
         Some(vec![Some(false), Some(true)])
     );
     assert_eq!(
-        frame.columns["byte1"].to_all_numbers(),
-        Some(vec![1u8, 100])
+        frame.columns["byte1"].to_all_numbers::<u8>().unwrap(),
+        vec![1u8, 100]
     );
     assert_eq!(
-        frame.columns["short1"].to_all_numbers(),
-        Some(vec![1024i16, 2048])
+        frame.columns["short1"].to_all_numbers::<i16>().unwrap(),
+        vec![1024i16, 2048]
     );
     assert_eq!(
-        frame.columns["int1"].to_all_numbers(),
-        Some(vec![65536i32, 65536])
+        frame.columns["int1"].to_all_numbers::<i32>().unwrap(),
+        vec![65536i32, 65536]
     );
     assert_eq!(
-        frame.columns["long1"].to_all_numbers(),
-        Some(vec![9223372036854775807i64, 9223372036854775807])
+        frame.columns["long1"].to_all_numbers::<i64>().unwrap(),
+        vec![9223372036854775807i64, 9223372036854775807]
     );
     assert_eq!(
-        frame.columns["float1"].to_all_numbers(),
-        Some(vec![1f32, 2.])
+        frame.columns["float1"].to_all_numbers::<f32>().unwrap(),
+        vec![1f32, 2.]
     );
     assert_eq!(
-        frame.columns["double1"].to_all_numbers(),
-        Some(vec![-15f64, -5.])
+        frame.columns["double1"].to_all_numbers::<f64>().unwrap(),
+        vec![-15f64, -5.]
     );
     assert_eq!(
         frame.columns["bytes1"].as_slices().unwrap(),

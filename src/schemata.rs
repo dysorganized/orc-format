@@ -498,7 +498,7 @@ impl Column {
     /// * This is a fast path for non-nullible columns, but it will fail (returning None)
     ///   if any nulls are present.
     /// * Type conversion failures will result in the whole column failing (with None)
-    pub fn to_all_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<N>> {
+    pub fn to_all_numbers<N: PrimNumCast>(&self) -> OrcResult<Vec<N>> {
         self.try_into()
     }
 
@@ -848,8 +848,8 @@ mod tests {
     fn column_from_json() {
         let orig = &[json!(1), json!(2), json!(3)];
         assert_eq!(
-            Column::from_json(orig).to_all_numbers(),
-            Some(vec![1, 2, 3])
+            Column::from_json(orig).to_all_numbers::<i64>().unwrap(),
+            vec![1, 2, 3]
         );
     }
 }
