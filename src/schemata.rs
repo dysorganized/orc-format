@@ -78,7 +78,11 @@ pub enum Column {
     /// For dates, the data is the days since 1970.  
     Int {present: Option<Vec<bool>>, data: Vec<i128>},
     /// `DIRECT` encoding for floats
-    Float {present: Option<Vec<bool>>, data: Vec<f64>},
+    Float {present: Option<Vec<bool>>, data: Vec<f32>},
+    /// `DIRECT` encoding for floats
+    Double {present: Option<Vec<bool>>, data: Vec<f64>},
+    /// `DIRECT` encoding for chars, strings, varchars, and blobs
+    String {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
     /// `DIRECT` encoding for chars, strings, varchars, and blobs
     Blob {present: Option<Vec<bool>>, data: Vec<u8>, length: Vec<u128>},
     /// For maps and lists, the data is the length.
@@ -146,21 +150,27 @@ impl Column {
             | Schema::Int{..}
             | Schema::Long{..}
             | Schema::Date{..} => Column::Int{present, data: int_enc(data?)?},
-            Schema::Float{..}
-            | Schema::Double{..} => {
-                // It would look like this
-                // ColumnContent::Float{data: FloatDecoder.from(data?)?}
-                todo!("Float decoding isn't supported yet for Column decoding")
+            Schema::Float{..}  => Column::Float{
+                present,
+                data: codecs::FloatDecoder::from(&data?[..])
+                .collect::<OrcResult<_>>()?
+            },
+            Schema::Double{..}  => Column::Double{
+                present,
+                data: codecs::DoubleDecoder::from(&data?[..])
+                .collect::<OrcResult<_>>()?
             },
             Schema::Decimal{..} => Column::Decimal{
                 present,
                 data: int_enc(data?)?,
                 scale: int_enc(slice_by_kind(Skind::Secondary)?)?
             },
+            Schema::Binary{..} => {
+                Column::Blob{present, data:data?.to_vec(), length: uint_enc(len?)?}
+            }
             Schema::String{..}
             | Schema::Varchar{..}
-            | Schema::Char{..}
-            | Schema::Binary{..} => Column::Blob{
+            | Schema::Char{..} => Column::Blob{
                 present,
                 data: codecs::ByteRLEDecoder::from(&data?[..])
                     .collect::<OrcResult<_>>()?,
@@ -196,7 +206,9 @@ impl Column {
             | Self::Byte {present, ..}
             | Self::Int {present, ..}
             | Self::Float {present, ..}
+            | Self::Double {present, ..}
             | Self::Blob {present, ..}
+            | Self::String {present, ..}
             | Self::Container {present, ..}
             | Self::Dict {present, ..}
             | Self::Decimal {present, ..}
@@ -205,8 +217,13 @@ impl Column {
         }
     }
 
-    /// Private method used by from_json to coerce JSON values into static types
-    fn coerce_vec<In, Out, F: Fn(&In) -> Option<Out>>(items: &[In], tran: F) -> (Option<Vec<bool>>, Vec<Out>) {
+    /// Private method used by from_json to coerce JSON values into arrow's split present stream
+    ///
+    /// Types:
+    ///    In: The content of the input vector (maybe a JSON Value)
+    ///    Out: The output of the transformation function (Maybe a primitive type like i64)
+    ///    F: The function you're trying to cast with
+    fn coerce_to_arrow_vecs<In, Out, F: Fn(&In) -> Option<Out>>(items: &[In], tran: F) -> (Option<Vec<bool>>, Vec<Out>) {
         // The present stream just records nulls separately from the data stream, easy.
         let coerced : Vec<_> = items.iter()
             .map(tran)
@@ -218,6 +235,31 @@ impl Column {
             Some(present)
         };
         (present, coerced.into_iter().filter_map(|x| x).collect())
+    }
+
+    /// Private method used by several to_xyz type methods to coerce arrow's split present stream into a vector of options
+    ///
+    /// Types:
+    ///    In: The content of the input vector (maybe a JSON Value)
+    ///    Out: The output of the transformation function (Maybe a primitive type like i64)
+    ///    F: The function you're trying to cast with
+    fn coerce_to_opt_vecs<In, Out, F: Fn(&In) -> Option<Out>>(present: &Option<Vec<bool>>, items: &[In], tran: F) -> Vec<Option<Out>> {
+        // If the present stream is Some(_) then it's length is the length of this stream.
+        // If present is None, then items length is the length of this stream.
+        match present {
+            Some(ref present_vec) => {
+                let mut item_idx = 0;
+                present_vec.iter().map(|&p| {
+                    if p && item_idx < items.len() {
+                        item_idx += 1;
+                        tran(&items[item_idx-1])
+                    } else {
+                        None
+                    }
+                }).collect()
+            },
+            None => items.iter().map(tran).collect()
+        }
     }
 
     /// Read a column from a vector of JSON values
@@ -241,17 +283,134 @@ impl Column {
             .cloned()
             .unwrap_or(json::Value::Bool(false));
         if type_guess.is_boolean() {
-            let (present, data) = Self::coerce_vec(items, |j| j.as_bool());
+            let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_bool());
             Column::Boolean { present, data }
         } else if type_guess.is_i64() {
-            let (present, data) = Self::coerce_vec(items, |j| j.as_i64().map(|x| x as i128));
+            let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_i64().map(|x| x as i128));
             Column::Int { present, data }
         } else if type_guess.is_f64() {
-            let (present, data) = Self::coerce_vec(items, |j| j.as_f64());
-            Column::Float { present, data }
+            let (present, data) = Self::coerce_to_arrow_vecs(items, |j| j.as_f64());
+            Column::Double { present, data }
         } else {
             todo!("Unsupported JSON Column type yet: {:?}", type_guess);
         }
+    }
+
+    /// Convert to a vector of nullable integers, if possible
+    ///
+    /// * The exact type is inferred, or you can override it.
+    /// * Type conversion failures will result in None for that element.
+    pub fn to_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<Option<N>>> {
+        match self {
+            Column::Int{present, data} => Some(
+                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
+            ),
+            Column::Float{present, data} => Some(
+                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
+            ),
+            Column::Double{present, data} => Some(
+                Self::coerce_to_opt_vecs(present, data, |x| N::from(*x))
+            ),
+            _ => None
+        }
+    }
+
+    /// Convert to a vector of non-nullable integers, if possible.
+    ///
+    /// * The exact numeric type is inferred, or you can override it.
+    /// * This is a fast path for non-nullible columns, but it will fail (returning None)
+    ///   if any nulls are present.
+    /// * Type conversion failures will result in the whole column failing (with None)
+    pub fn to_all_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<N>> {
+        if self.present().is_some() {
+            // The present stream wasn't omitted so there must be a null somewhere
+            return None;
+        }
+        match self {
+            Column::Int{data, ..} =>
+                data.iter().map(|x| N::from(*x)).collect(),
+            Column::Float{data, ..} =>
+                data.iter().map(|x| N::from(*x)).collect(),
+            Column::Double{data, ..} =>
+                data.iter().map(|x| N::from(*x)).collect(),
+            _ => None
+        }
+    }
+
+    /// View the column as a vector of byte slices, if it's possible.
+    ///
+    /// This is supported only for Blob columns, and for String columns
+    /// which are also aliased as Char and Varchar.
+    pub fn as_byte_slices(&self) -> Option<Vec<Option<&[u8]>>> {
+        match self {
+            Column::Blob{length, data, present}
+            | Column::String{length, data, present} => {
+                let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
+                let mut blobs: Vec<Option<&[u8]>> = vec![];
+                let mut byte_cursor = 0; // Where are we in the concatenated string
+                for blob_ix in 0..blob_count {
+                    if blobs.len() < length.len() && (present.is_none() || present.as_ref().unwrap()[blob_ix]) {
+                        let blob_len = length[blobs.len()] as usize;
+                        blobs.push(Some(&data[byte_cursor..byte_cursor+blob_len]));
+                        byte_cursor += blob_len;
+                    } else {
+                        blobs.push(None);
+                    }
+                }
+                Some(blobs)
+            },
+            _ => None // These are not blobs
+        }
+    }
+
+    /// Convert the column to s vector of strings, if it's possible.
+    ///
+    /// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
+    pub fn to_vecs(&self) -> Option<Vec<Option<Vec<u8>>>> {
+        Some(self.as_byte_slices()?
+            .into_iter()
+            .map(|opt_slc| Some(opt_slc?.to_vec()))
+            .collect())
+    }
+
+    /// Convert the column to a vector of str, if possible.
+    ///
+    /// * This doesn't allocate but may still be fairly slow since it does check utf8 validity.
+    /// * Since ORC requires UTF8 for strings, errors are unlikely unless you read blobs as strings.  
+    /// * This is intended as a 
+    /// * If you need more speed, and you're sure you have only utf8, 
+    ///     consider using `as_byte_slices()` with `from_utf8_unchecked()`.
+    /// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
+    pub fn as_strs(&self) -> OrcResult<Option<Vec<Option<&str>>>> {
+        // This is a tad longer because it's clearer (to me) how the error propagates
+        match self.as_byte_slices() {
+            None => Ok(None),
+            Some(slices) => {
+                let mut col = vec![];
+                for row in slices {
+                    col.push(match row {
+                        None => None,
+                        // Any failing string will halt decoding the column
+                        Some(slc) => Some(std::str::from_utf8(slc)?)
+                    });
+                }
+                Ok(Some(col))
+            }
+        }
+    }
+
+    /// Convert the column to a vector of strings, if possible.
+    ///
+    /// This is based on `as_strs()` and inherits its tradeoffs.
+    /// It will likely be slowe though, because it introduces a lot of allocation.
+    pub fn to_strings(&self) -> OrcResult<Option<Vec<Option<String>>>> {
+        self.as_strs().map(|op_vec_op|
+            op_vec_op.map(|vec_op|
+                vec_op.into_iter().map(|op|
+                    op.map(|s| s.to_owned())
+                ).collect()
+            )
+        )
     }
 }
 // TODO: Write this more compactly
@@ -264,7 +423,7 @@ macro_rules! basic_column_from_vec {
         }
         impl From<Vec<Option<$prim>>> for Column {
             fn from(data: Vec<Option<$prim>>) -> Self {
-                let (present, data) = Column::coerce_vec(&data, |d| d.map(|x| x.clone().into()));
+                let (present, data) = Column::coerce_to_arrow_vecs(&data, |d| d.map(|x| x.clone().into()));
                 $constructor { present, data }
             }
         }
@@ -325,19 +484,22 @@ mod tests {
     fn test_column_coerce_vec() {
         // Mixed types
         let items = &[json!(true), json!(false), json!(null), json!("foo")];
-        let (present, data) = Column::coerce_vec(items, |j| j.as_bool());
+        let (present, data) = Column::coerce_to_arrow_vecs(items, |j| j.as_bool());
         assert_eq!(present, Some(vec![true, true, false, false]));
         assert_eq!(data , vec![true, false]);
 
         // All present
         let items = &[json!(true), json!(false)];
-        let (present, data) = Column::coerce_vec(items, |j| j.as_bool());
+        let (present, data) = Column::coerce_to_arrow_vecs(items, |j| j.as_bool());
         assert_eq!(present, None);
         assert_eq!(data , vec![true, false]);
     }
     #[test]
     fn column_from_json() {
         let orig = &[json!(1), json!(2), json!(3)];
-        Column::from_json(orig);
+        assert_eq!(
+            Column::from_json(orig).to_all_numbers(),
+            Some(vec![1,2,3])
+        );
     }
 }

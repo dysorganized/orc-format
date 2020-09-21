@@ -1,6 +1,6 @@
 use num_traits::{Num, NumCast, PrimInt};
-use std::marker::PhantomData;
-use super::errors::*
+use std::{marker::PhantomData, convert::TryInto};
+use super::errors::*;
 use crate::nibble::Nibble;
 
 /// Helper trait allowing RLE1/2 to work for both signed and unsigned
@@ -103,6 +103,60 @@ impl<'t> Decoder<'t> for ByteRLEDecoder<'t> {
                 self.buf = &self.buf[2..];
             }
             self.next_result()
+        }
+    }
+}
+
+/// 32 bit float storage. It's not so much an encoding as just an array.
+#[derive(Debug)]
+pub struct FloatDecoder<'t> {
+    buf: &'t [u8]
+}
+decoder_iter!(FloatDecoder<'t>, f32);
+impl<'t> From<&'t[u8]> for FloatDecoder<'t> {
+    fn from(buf: &'t[u8]) -> Self {
+        FloatDecoder { buf }
+    }
+}
+impl<'t> Decoder<'t> for FloatDecoder<'t> {
+    type Output = f32;
+    fn remainder(&self) -> &'t [u8] {
+        self.buf
+    }
+    fn next_result(&mut self) -> OrcResult<Self::Output> {
+        if self.buf.len() < 4 {
+            Err(OrcError::EndOfStream)
+        } else {
+            let f = f32::from_be_bytes(self.buf[..4].try_into().unwrap());
+            self.buf = &self.buf[4..];
+            Ok(f)
+        }
+    }
+}
+
+/// 64 bit float storage. It's not so much an encoding as just an array.
+#[derive(Debug)]
+pub struct DoubleDecoder<'t> {
+    buf: &'t [u8]
+}
+decoder_iter!(DoubleDecoder<'t>, f64);
+impl<'t> From<&'t[u8]> for DoubleDecoder<'t> {
+    fn from(buf: &'t[u8]) -> Self {
+        DoubleDecoder { buf }
+    }
+}
+impl<'t> Decoder<'t> for DoubleDecoder<'t> {
+    type Output = f64;
+    fn remainder(&self) -> &'t [u8] {
+        self.buf
+    }
+    fn next_result(&mut self) -> OrcResult<Self::Output> {
+        if self.buf.len() < 8 {
+            Err(OrcError::EndOfStream)
+        } else {
+            let f = f64::from_be_bytes(self.buf[..8].try_into().unwrap());
+            self.buf = &self.buf[8..];
+            Ok(f)
         }
     }
 }
@@ -463,3 +517,4 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         }
     }
 }
+

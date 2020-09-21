@@ -19,7 +19,9 @@ pub enum OrcError {
     #[error("Bit sequence was too long for the target type. Are you reading a literal over 4GB on a 32bit machine?")]
     LongBitstring,
     #[error("JSON deserialization error: {0}")]
-    SerdeError(#[from] serde_json::Error)
+    SerdeError(#[from] serde_json::Error),
+    #[error("Corrupt UTF8 string: {0}")]
+    UTF8Error(#[from] std::str::Utf8Error)
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;
