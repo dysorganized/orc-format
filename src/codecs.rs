@@ -502,7 +502,9 @@ impl<'t, S: Sign> Decoder<'t> for RLE2<'t, S> {
         self.length = self.length.saturating_sub(1);
         match self.mode {
             RLE2Mode::ShortRepeat(item) => Ok(item),
-            RLE2Mode::Direct => Ok(S::unzigzag(self.nib.read(self.width, "RLE2 direct encoded int")?)),
+            RLE2Mode::Direct => Ok(S::unzigzag(
+                self.nib.read(self.width, "RLE2 direct encoded int")?,
+            )),
             RLE2Mode::PatchedBase {
                 base,
                 patch_width,

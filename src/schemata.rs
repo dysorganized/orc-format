@@ -184,9 +184,11 @@ pub enum Column {
         nanos: Vec<u128>,
     },
     /// Structs only store if they are present. The rest is in other columns.
-    Struct { present: Option<Vec<bool>> },
+    Struct {
+        present: Option<Vec<bool>>,
+    },
     // Unions are not supported.
-    Unsupported(&'static str)
+    Unsupported(&'static str),
 }
 
 impl Column {
@@ -318,7 +320,11 @@ impl Column {
                 }
             }
             Schema::Map { .. } => Column::Unsupported("Map columns are not supported yet."),
-            Schema::List { .. } => Column::Unsupported("List columns are not supported yet."),
+            Schema::List { inner, .. } => Column::List {
+                present,
+                length: uint_enc(len?)?,
+                elements: Box::new(Column::new(stripe, inner, enc, streams, orc)?),
+            },
             Schema::Struct { .. } => Column::Struct { present },
             Schema::Timestamp { .. } => {
                 // It could look something like this:
@@ -332,7 +338,9 @@ impl Column {
                 // }
                 Column::Unsupported("Timestamp decoding is not supported yet for Column decoding")
             }
-            Schema::Union { .. } => Column::Unsupported("Union columns are not well defined or supported")
+            Schema::Union { .. } => {
+                Column::Unsupported("Union columns are not well defined or supported")
+            }
         };
         Ok(content)
     }
@@ -355,7 +363,7 @@ impl Column {
             | Self::Decimal { present, .. }
             | Self::Timestamp { present, .. }
             | Self::Struct { present } => present,
-            Self::Unsupported(note) => unimplemented!("{}", note)
+            Self::Unsupported(note) => unimplemented!("{}", note),
         }
     }
 
@@ -452,8 +460,8 @@ impl Column {
         match self {
             Column::Boolean { present, data } => {
                 Some(Self::coerce_to_opt_vecs(present, data, |x| Some(*x)))
-            },
-            _ => None
+            }
+            _ => None,
         }
     }
 
@@ -491,7 +499,7 @@ impl Column {
             return None;
         }
         match self {
-            Column::Byte{ data, .. } => data.iter().map(|x| N::from(*x)).collect(),
+            Column::Byte { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Int { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Float { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
             Column::Double { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
@@ -502,13 +510,13 @@ impl Column {
     /// Split a concatenated array of blobs into a vector of optional slices
     ///
     /// This is used by as_byte_slices to handle the common parts of direct and dictionary encoding
-    fn split_nullible_byte_stream<'t>(
+    fn split_nullible_stream<'t, X>(
         present: &Option<Vec<bool>>,
         length: &Vec<u128>,
-        data: &'t Vec<u8>,
-    ) -> Vec<Option<&'t [u8]>> {
+        data: &'t Vec<X>,
+    ) -> Vec<Option<&'t [X]>> {
         let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(length.len());
-        let mut blobs: Vec<Option<&[u8]>> = vec![];
+        let mut blobs: Vec<Option<&[X]>> = vec![];
         let mut byte_cursor = 0; // Where are we in the concatenated string
         for blob_ix in 0..blob_count {
             if blobs.len() < length.len()
@@ -528,14 +536,18 @@ impl Column {
     ///
     /// This is supported only for Blob columns, and for String columns
     /// which are also aliased as Char and Varchar.
-    pub fn as_byte_slices(&self) -> Option<Vec<Option<&[u8]>>> {
+    pub fn as_slices(&self) -> Option<Vec<Option<&[u8]>>> {
         match self {
+            // Blobs are stored concatenated, with a separate vector of lengths
             Column::Blob {
                 length,
                 data,
                 present,
                 ..
-            } => Some(Self::split_nullible_byte_stream(present, length, data)),
+            } => Some(Self::split_nullible_stream(present, length, data)),
+            // Dictionary compressed blobs are stored as a sorted concatenated dictionary,
+            // lengths of the keys of that dictionary in the same order,
+            // and a vector of references into that dictionary
             Column::BlobDict {
                 length,
                 data,
@@ -544,7 +556,7 @@ impl Column {
                 ..
             } => {
                 // First the dictionary is read like a standard string column
-                let dictionary = Self::split_nullible_byte_stream(&None, length, dictionary_data);
+                let dictionary = Self::split_nullible_stream(&None, length, dictionary_data);
 
                 // Then we decompress the rest using the dictionary
                 let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(data.len());
@@ -560,16 +572,17 @@ impl Column {
                 }
                 Some(blobs)
             }
+            
             _ => None, // These are not blobs
         }
     }
 
-    /// Convert the column to s vector of strings, if it's possible.
+    /// Convert the column to a vector of blobs, if it's possible.
     ///
     /// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
     pub fn to_vecs(&self) -> Option<Vec<Option<Vec<u8>>>> {
         Some(
-            self.as_byte_slices()?
+            self.as_slices()?
                 .into_iter()
                 .map(|opt_slc| Some(opt_slc?.to_vec()))
                 .collect(),
@@ -588,7 +601,7 @@ impl Column {
         // This is a tad longer because it's clearer (to me) how the error propagates
         // TODO: We could avoid checking UTF8 for each string if it was dictionary compressed
         // TODO: Should we allow decoding Blobs as strings? We do now because we don't check Column::Blob::utf8
-        match self.as_byte_slices() {
+        match self.as_slices() {
             None => Ok(None),
             Some(slices) => {
                 let mut col = vec![];
