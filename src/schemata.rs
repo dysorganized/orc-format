@@ -4,8 +4,8 @@ use crate::messages;
 use crate::toc::{ORCFile, Stripe};
 use bytes::Bytes;
 use serde_json as json;
-use std::collections::HashMap;
 use std::io::{BufRead, Read, Seek};
+use std::{collections::HashMap, convert::TryFrom, convert::TryInto};
 
 /// Table Schema
 ///
@@ -345,6 +345,25 @@ impl Column {
         Ok(content)
     }
 
+    /// Get the name of the variant as a str
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Boolean { .. } => "Boolean",
+            Self::Byte { .. } => "Byte",
+            Self::Int { .. } => "Int",
+            Self::Float { .. } => "Float",
+            Self::Double { .. } => "Double",
+            Self::Blob { .. } => "Blob",
+            Self::BlobDict { .. } => "BlobDict",
+            Self::Map { .. } => "Map",
+            Self::List { .. } => "List",
+            Self::Decimal { .. } => "Decimal",
+            Self::Timestamp { .. } => "Timestamp",
+            Self::Struct { .. } => "Struct",
+            Self::Unsupported(..) => "Unsupported",
+        }
+    }
+
     /// A stream indicating whether the row is non-null
     ///
     /// If it's empty (e.g. None, not length 0) then all rows are present.
@@ -469,22 +488,8 @@ impl Column {
     ///
     /// * The exact type is inferred, or you can override it.
     /// * Type conversion failures will result in None for that element.
-    pub fn to_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<Option<N>>> {
-        match self {
-            Column::Byte { present, data } => {
-                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
-            }
-            Column::Int { present, data } => {
-                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
-            }
-            Column::Float { present, data } => {
-                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
-            }
-            Column::Double { present, data } => {
-                Some(Self::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
-            }
-            _ => None,
-        }
+    pub fn to_numbers<N: PrimNumCast>(&self) -> OrcResult<Vec<Option<N>>> {
+        self.try_into()
     }
 
     /// Convert to a vector of non-nullable integers, if possible.
@@ -494,17 +499,7 @@ impl Column {
     ///   if any nulls are present.
     /// * Type conversion failures will result in the whole column failing (with None)
     pub fn to_all_numbers<N: num_traits::NumCast>(&self) -> Option<Vec<N>> {
-        if self.present().is_some() {
-            // The present stream wasn't omitted so there must be a null somewhere
-            return None;
-        }
-        match self {
-            Column::Byte { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
-            Column::Int { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
-            Column::Float { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
-            Column::Double { data, .. } => data.iter().map(|x| N::from(*x)).collect(),
-            _ => None,
-        }
+        self.try_into()
     }
 
     /// Split a concatenated array of blobs into a vector of optional slices
@@ -536,15 +531,53 @@ impl Column {
     ///
     /// This is supported only for Blob columns, and for String columns
     /// which are also aliased as Char and Varchar.
-    pub fn as_slices(&self) -> Option<Vec<Option<&[u8]>>> {
-        match self {
+    pub fn as_slices(&self) -> OrcResult<Vec<Option<&[u8]>>> {
+        self.try_into()
+    }
+
+    /// Convert the column to a vector of blobs, if it's possible.
+    ///
+    /// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
+    pub fn to_vecs(&self) -> OrcResult<Vec<Option<Vec<u8>>>> {
+        self.try_into()
+    }
+
+    /// Convert the column to a vector of str, if possible.
+    ///
+    /// * This doesn't allocate but may still be fairly slow since it does check utf8 validity.
+    /// * Since ORC requires UTF8 for strings, errors are unlikely unless you read blobs as strings.  
+    /// * This is intended as a
+    /// * If you need more speed, and you're sure you have only utf8,
+    ///     consider using `as_byte_slices()` with `from_utf8_unchecked()`.
+    /// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
+    pub fn as_strs(&self) -> OrcResult<Vec<Option<&str>>> {
+        self.try_into()
+    }
+
+    /// Convert the column to a vector of strings, if possible.
+    ///
+    /// This is based on `as_strs()` and inherits its tradeoffs.
+    /// It will likely be slowe though, because it introduces a lot of allocation.
+    pub fn to_strings(&self) -> OrcResult<Vec<Option<String>>> {
+        self.try_into()
+    }
+}
+
+/// View the column as a vector of byte slices, if it's possible.
+///
+/// This is supported only for Blob columns, and for String columns
+/// which are also aliased as Char and Varchar.
+impl<'t> TryFrom<&'t Column> for Vec<Option<&'t [u8]>> {
+    type Error = OrcError;
+    fn try_from(col: &'t Column) -> OrcResult<Self> {
+        match col {
             // Blobs are stored concatenated, with a separate vector of lengths
             Column::Blob {
                 length,
                 data,
                 present,
                 ..
-            } => Some(Self::split_nullible_stream(present, length, data)),
+            } => Ok(Column::split_nullible_stream(present, length, data)),
             // Dictionary compressed blobs are stored as a sorted concatenated dictionary,
             // lengths of the keys of that dictionary in the same order,
             // and a vector of references into that dictionary
@@ -556,7 +589,7 @@ impl Column {
                 ..
             } => {
                 // First the dictionary is read like a standard string column
-                let dictionary = Self::split_nullible_stream(&None, length, dictionary_data);
+                let dictionary = Column::split_nullible_stream(&None, length, dictionary_data);
 
                 // Then we decompress the rest using the dictionary
                 let blob_count = present.as_ref().map(|p| p.len()).unwrap_or(data.len());
@@ -570,68 +603,160 @@ impl Column {
                         blobs.push(None);
                     }
                 }
-                Some(blobs)
+                Ok(blobs)
             }
-            
-            _ => None, // These are not blobs
+            _ => Err(OrcError::ColumnCastException(
+                col.variant_name(),
+                "Vec<Option<&[u8]>>",
+            )), // These are not blobs
         }
     }
+}
 
-    /// Convert the column to a vector of blobs, if it's possible.
-    ///
-    /// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
-    pub fn to_vecs(&self) -> Option<Vec<Option<Vec<u8>>>> {
-        Some(
-            self.as_slices()?
-                .into_iter()
-                .map(|opt_slc| Some(opt_slc?.to_vec()))
-                .collect(),
-        )
+/// Convert the column to a vector of blobs, if it's possible.
+///
+/// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
+impl TryFrom<&Column> for Vec<Option<Vec<u8>>> {
+    type Error = OrcError;
+    fn try_from(col: &Column) -> OrcResult<Self> {
+        Ok(col
+            .as_slices()?
+            .into_iter()
+            .map(|opt_slc| Some(opt_slc?.to_vec()))
+            .collect())
     }
+}
 
-    /// Convert the column to a vector of str, if possible.
-    ///
-    /// * This doesn't allocate but may still be fairly slow since it does check utf8 validity.
-    /// * Since ORC requires UTF8 for strings, errors are unlikely unless you read blobs as strings.  
-    /// * This is intended as a
-    /// * If you need more speed, and you're sure you have only utf8,
-    ///     consider using `as_byte_slices()` with `from_utf8_unchecked()`.
-    /// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
-    pub fn as_strs(&self) -> OrcResult<Option<Vec<Option<&str>>>> {
+/// Convert the column to a vector of str, if possible.
+///
+/// * This doesn't allocate but may still be fairly slow since it does check utf8 validity.
+/// * Since ORC requires UTF8 for strings, errors are unlikely unless you read blobs as strings.  
+/// * This is intended as a
+/// * If you need more speed, and you're sure you have only utf8,
+///     consider using `as_byte_slices()` with `from_utf8_unchecked()`.
+/// * If you need more error granularity, use `as_byte_slices()` with `from_utf8()`.
+impl<'t> TryFrom<&'t Column> for Vec<Option<&'t str>> {
+    type Error = OrcError;
+    fn try_from(col: &'t Column) -> OrcResult<Self> {
         // This is a tad longer because it's clearer (to me) how the error propagates
         // TODO: We could avoid checking UTF8 for each string if it was dictionary compressed
         // TODO: Should we allow decoding Blobs as strings? We do now because we don't check Column::Blob::utf8
-        match self.as_slices() {
-            None => Ok(None),
-            Some(slices) => {
-                let mut col = vec![];
-                for row in slices {
-                    col.push(match row {
-                        None => None,
-                        // Any failing string will halt decoding the column
-                        Some(slc) => Some(std::str::from_utf8(slc)?),
-                    });
-                }
-                Ok(Some(col))
-            }
+        let slices = col.as_slices()?;
+        let mut col = vec![];
+        for row in slices {
+            col.push(match row {
+                None => None,
+                // Any failing string will halt decoding the column
+                Some(slc) => Some(std::str::from_utf8(slc)?),
+            });
         }
-    }
-
-    /// Convert the column to a vector of strings, if possible.
-    ///
-    /// This is based on `as_strs()` and inherits its tradeoffs.
-    /// It will likely be slowe though, because it introduces a lot of allocation.
-    pub fn to_strings(&self) -> OrcResult<Option<Vec<Option<String>>>> {
-        self.as_strs().map(|op_vec_op| {
-            op_vec_op.map(|vec_op| {
-                vec_op
-                    .into_iter()
-                    .map(|op| op.map(|s| s.to_owned()))
-                    .collect()
-            })
-        })
+        Ok(col)
     }
 }
+
+/// Convert the column to a vector of blobs, if it's possible.
+///
+/// This does a whole lot of allocation, so expect it to be slow. Prefer slices if possible.
+impl TryFrom<&Column> for Vec<Option<String>> {
+    type Error = OrcError;
+    fn try_from(col: &Column) -> OrcResult<Self> {
+        Ok(col
+            .as_strs()?
+            .into_iter()
+            .map(|op| op.map(|s| s.to_owned()))
+            .collect())
+    }
+}
+
+/// Local trait, to generalize over primitive numbers
+/// It's necessary because remote traits could have a conflict in the future
+/// In this case it wouldn't but the compiler doesn't know that.
+pub trait PrimNumCast: num_traits::NumCast {}
+impl PrimNumCast for u8 {}
+impl PrimNumCast for i8 {}
+impl PrimNumCast for u16 {}
+impl PrimNumCast for i16 {}
+impl PrimNumCast for u32 {}
+impl PrimNumCast for i32 {}
+impl PrimNumCast for u64 {}
+impl PrimNumCast for i64 {}
+impl PrimNumCast for usize {}
+impl PrimNumCast for isize {}
+impl PrimNumCast for f32 {}
+impl PrimNumCast for f64 {}
+
+/// Convert to a vector of nullable integers, if possible
+///
+/// * The exact type is inferred, or you can override it.
+/// * Type conversion failures will result in None for that element.
+impl<N: PrimNumCast> TryFrom<&Column> for Vec<Option<N>> {
+    type Error = OrcError;
+    fn try_from(col: &Column) -> OrcResult<Self> {
+        match col {
+            Column::Byte { present, data } => {
+                Ok(Column::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            Column::Int { present, data } => {
+                Ok(Column::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            Column::Float { present, data } => {
+                Ok(Column::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            Column::Double { present, data } => {
+                Ok(Column::coerce_to_opt_vecs(present, data, |x| N::from(*x)))
+            }
+            _ => Err(OrcError::ColumnCastException(
+                col.variant_name(),
+                "a nullable numeric type",
+            )),
+        }
+    }
+}
+
+/// Convert to a vector of non-nullable integers, if possible.
+///
+/// * The exact numeric type is inferred, or you can override it.
+/// * This is a fast path for non-nullible columns, but it will fail
+///   if any nulls are present.
+/// * Type conversion failures will result in the whole column failing
+impl<N: PrimNumCast> TryFrom<&Column> for Vec<N> {
+    type Error = OrcError;
+    fn try_from(col: &Column) -> OrcResult<Self> {
+        if col.present().is_some() {
+            // The present stream wasn't omitted so there must be a null somewhere
+            return Err(OrcError::ColumnCastException(
+                col.variant_name(),
+                "a non-nullable numeric type (nulls are present)",
+            ));
+        }
+        let conversion_failed = || {
+            OrcError::ColumnCastException(
+                col.variant_name(),
+                "a nullable numeric type (invalid numeric conversion)",
+            )
+        };
+        match col {
+            Column::Byte { data, .. } => data
+                .iter()
+                .map(|x| N::from(*x).ok_or_else(conversion_failed))
+                .collect(),
+            Column::Int { data, .. } => data
+                .iter()
+                .map(|x| N::from(*x).ok_or_else(conversion_failed))
+                .collect(),
+            Column::Float { data, .. } => data
+                .iter()
+                .map(|x| N::from(*x).ok_or_else(conversion_failed))
+                .collect(),
+            Column::Double { data, .. } => data
+                .iter()
+                .map(|x| N::from(*x).ok_or_else(conversion_failed))
+                .collect(),
+            _ => Err(conversion_failed()),
+        }
+    }
+}
+
 // TODO: Write this more compactly
 macro_rules! basic_column_from_vec {
     ($prim:ty, $constructor:path) => {

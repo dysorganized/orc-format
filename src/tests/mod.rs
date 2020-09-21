@@ -277,20 +277,20 @@ fn go_read_test1() {
         Some(vec![-15f64, -5.])
     );
     assert_eq!(
-        frame.columns["bytes1"].as_slices(),
-        Some(vec![Some(&[0, 1, 2, 3, 4][..]), Some(&[])])
+        frame.columns["bytes1"].as_slices().unwrap(),
+        vec![Some(&[0, 1, 2, 3, 4][..]), Some(&[])]
     );
     assert_eq!(
-        frame.columns["bytes1"].to_vecs(),
-        Some(vec![Some(vec![0, 1, 2, 3, 4]), Some(vec![])])
+        frame.columns["bytes1"].to_vecs().unwrap(),
+        vec![Some(vec![0, 1, 2, 3, 4]), Some(vec![])]
     );
     assert_eq!(
         frame.columns["string1"].as_strs().unwrap(),
-        Some(vec![Some("hi"), Some("bye")])
+        vec![Some("hi"), Some("bye")]
     );
     assert_eq!(
         frame.columns["string1"].to_strings().unwrap(),
-        Some(vec![Some("hi".to_string()), Some("bye".to_string())])
+        vec![Some("hi".to_string()), Some("bye".to_string())]
     );
     // TODO: column "middle" (a struct)
     // TODO: column "list"

@@ -22,6 +22,8 @@ pub enum OrcError {
     SerdeError(#[from] serde_json::Error),
     #[error("Corrupt UTF8 string: {0}")]
     UTF8Error(#[from] std::str::Utf8Error),
+    #[error("Cannot cast a {0} column to {1}")]
+    ColumnCastException(&'static str, &'static str),
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;
