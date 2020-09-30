@@ -22,61 +22,137 @@ fn test_read_footer() {
     let orc_bytes = include_bytes!("sample.orc");
     let orc_toc = crate::toc::ORCFile::from_slice(&orc_bytes[..]).unwrap();
     // The metadata is empty
-    assert_eq!(orc_toc.user_metadata(), hashmap!{});
+    assert_eq!(orc_toc.user_metadata(), hashmap! {});
     // This is a bit verbose but the point is to stress test the type system
-    assert_eq!(orc_toc.schema(), &[
-        ("_col0".into(), Sch::Boolean { id: 1 }),
-        ("_col1".into(), Sch::Byte { id: 2 }),
-        ("_col2".into(), Sch::Short { id: 3 }),
-        ("_col3".into(), Sch::Int { id: 4 }),
-        ("_col4".into(), Sch::Long { id: 5 }),
-        ("_col5".into(), Sch::Float { id: 6 }),
-        ("_col6".into(), Sch::Double { id: 7 }),
-        ("_col7".into(), Sch::Decimal { id: 8, precision: 10, scale: 0 }),
-        ("_col8".into(), Sch::Char { id: 9, length: 1 }),
-        ("_col9".into(), Sch::Char { id: 10, length: 3 }),
-        ("_col10".into(), Sch::String { id: 11 }),
-        ("_col11".into(), Sch::Varchar { id: 12, length: 10 }),
-        ("_col12".into(), Sch::Binary { id: 13 }),
-        ("_col13".into(), Sch::Binary { id: 14 }),
-        ("_col14".into(), Sch::Date { id: 15 }),
-        ("_col15".into(), Sch::Timestamp { id: 16 }),
-        ("_col16".into(), Sch::List { id: 17, inner: Box::new(Sch::Int { id: 18 }) }),
-        ("_col17".into(), Sch::List { id: 19, inner: Box::new(Sch::List { id: 20, inner: Box::new(Sch::Int { id: 21 }) }) }),
-        ("_col18".into(), Sch::Struct { id: 22, fields: vec![
-            ("city".into(), Sch::String { id: 23 }),
-            ("population".into(), Sch::Int { id: 24 })
-        ] }),
-        ("_col19".into(), Sch::Struct { id: 25, fields: vec![
-            ("city".into(), Sch::Struct { id: 26, fields: vec![
-                ("name".into(), Sch::String { id: 27 }),
-                ("population".into(), Sch::Int { id: 28 })
-            ] }),
-            ("state".into(), Sch::String { id: 29 })
-        ] }),
-        ("_col20".into(), Sch::List { id: 30, inner: Box::new(Sch::Struct { id: 31, fields: vec![
-            ("city".into(), Sch::String { id: 32 }),
-            ("population".into(), Sch::Int { id: 33 })
-        ] }) }),
-        ("_col21".into(), Sch::Struct { id: 34, fields: vec![
-            ("city".into(), Sch::List { id: 35, inner: Box::new(Sch::String { id: 36 }) }),
-            ("population".into(), Sch::List { id: 37, inner: Box::new(Sch::Int { id: 38 }) })
-        ] }),
-        ("_col22".into(), Sch::Map {
-            id: 39,
-            key: Box::new(Sch::Int { id: 41 }),
-            value: Box::new(Sch::String { id: 40 })
-        }),
-        ("_col23".into(), Sch::Map {
-            id: 42,
-            key: Box::new(Sch::Map {
-                id: 44,
-                key: Box::new(Sch::Int { id: 46 }),
-                value: Box::new(Sch::String { id: 45 })
-            }),
-            value: Box::new(Sch::String { id: 43 })
-        })
-    ]);
+    assert_eq!(
+        orc_toc.schema(),
+        &[
+            ("_col0".into(), Sch::Boolean { id: 1 }),
+            ("_col1".into(), Sch::Byte { id: 2 }),
+            ("_col2".into(), Sch::Short { id: 3 }),
+            ("_col3".into(), Sch::Int { id: 4 }),
+            ("_col4".into(), Sch::Long { id: 5 }),
+            ("_col5".into(), Sch::Float { id: 6 }),
+            ("_col6".into(), Sch::Double { id: 7 }),
+            (
+                "_col7".into(),
+                Sch::Decimal {
+                    id: 8,
+                    precision: 10,
+                    scale: 0
+                }
+            ),
+            ("_col8".into(), Sch::Char { id: 9, length: 1 }),
+            ("_col9".into(), Sch::Char { id: 10, length: 3 }),
+            ("_col10".into(), Sch::String { id: 11 }),
+            ("_col11".into(), Sch::Varchar { id: 12, length: 10 }),
+            ("_col12".into(), Sch::Binary { id: 13 }),
+            ("_col13".into(), Sch::Binary { id: 14 }),
+            ("_col14".into(), Sch::Date { id: 15 }),
+            ("_col15".into(), Sch::Timestamp { id: 16 }),
+            (
+                "_col16".into(),
+                Sch::List {
+                    id: 17,
+                    inner: Box::new(Sch::Int { id: 18 })
+                }
+            ),
+            (
+                "_col17".into(),
+                Sch::List {
+                    id: 19,
+                    inner: Box::new(Sch::List {
+                        id: 20,
+                        inner: Box::new(Sch::Int { id: 21 })
+                    })
+                }
+            ),
+            (
+                "_col18".into(),
+                Sch::Struct {
+                    id: 22,
+                    fields: vec![
+                        ("city".into(), Sch::String { id: 23 }),
+                        ("population".into(), Sch::Int { id: 24 })
+                    ]
+                }
+            ),
+            (
+                "_col19".into(),
+                Sch::Struct {
+                    id: 25,
+                    fields: vec![
+                        (
+                            "city".into(),
+                            Sch::Struct {
+                                id: 26,
+                                fields: vec![
+                                    ("name".into(), Sch::String { id: 27 }),
+                                    ("population".into(), Sch::Int { id: 28 })
+                                ]
+                            }
+                        ),
+                        ("state".into(), Sch::String { id: 29 })
+                    ]
+                }
+            ),
+            (
+                "_col20".into(),
+                Sch::List {
+                    id: 30,
+                    inner: Box::new(Sch::Struct {
+                        id: 31,
+                        fields: vec![
+                            ("city".into(), Sch::String { id: 32 }),
+                            ("population".into(), Sch::Int { id: 33 })
+                        ]
+                    })
+                }
+            ),
+            (
+                "_col21".into(),
+                Sch::Struct {
+                    id: 34,
+                    fields: vec![
+                        (
+                            "city".into(),
+                            Sch::List {
+                                id: 35,
+                                inner: Box::new(Sch::String { id: 36 })
+                            }
+                        ),
+                        (
+                            "population".into(),
+                            Sch::List {
+                                id: 37,
+                                inner: Box::new(Sch::Int { id: 38 })
+                            }
+                        )
+                    ]
+                }
+            ),
+            (
+                "_col22".into(),
+                Sch::Map {
+                    id: 39,
+                    key: Box::new(Sch::Int { id: 41 }),
+                    value: Box::new(Sch::String { id: 40 })
+                }
+            ),
+            (
+                "_col23".into(),
+                Sch::Map {
+                    id: 42,
+                    key: Box::new(Sch::Map {
+                        id: 44,
+                        key: Box::new(Sch::Int { id: 46 }),
+                        value: Box::new(Sch::String { id: 45 })
+                    }),
+                    value: Box::new(Sch::String { id: 43 })
+                }
+            )
+        ]
+    );
 }
 
 // #[test]
@@ -144,7 +220,7 @@ fn read_column() {
     let orc_bytes = include_bytes!("sample.orc");
     let ref mut orc_toc = crate::ORCFile::from_slice(&orc_bytes[..]).unwrap();
     let stripe = orc_toc.stripe(0).unwrap();
-    if let Column::Boolean{data, ..} = stripe.column(1, orc_toc).unwrap() {
+    if let Column::Boolean { data, .. } = stripe.column(1, orc_toc).unwrap() {
         assert_eq!(data, vec![true, true, false]);
     } else {
         panic!("Why is there no boolean in this sample");

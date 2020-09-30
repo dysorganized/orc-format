@@ -1,5 +1,5 @@
-use crate::errors::*;
 use crate::codecs::*;
+use crate::errors::*;
 use crate::nibble::Nibble;
 
 #[test]
@@ -11,37 +11,49 @@ fn test_byte_rle_decoder() {
 
 #[test]
 fn test_bool_rle_decoder() {
-    let encoded_test : BooleanRLEDecoder = hex!("FF 80")[..].into();
+    let encoded_test: BooleanRLEDecoder = hex!("FF 80")[..].into();
     let dec: OrcResult<Vec<bool>> = encoded_test.collect();
-    assert_eq!(dec.unwrap(), &[true, false, false, false, false, false, false, false]);
+    assert_eq!(
+        dec.unwrap(),
+        &[true, false, false, false, false, false, false, false]
+    );
 }
 
 #[test]
 fn test_varint128_decoder() {
-    let encoded_test : VarDecoder<u128> = hex!("
+    let encoded_test: VarDecoder<u128> = hex!(
+        "
         96 01    96 01    00
-        FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 03")[..].into();
+        FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF 03"
+    )[..]
+        .into();
     let dec: OrcResult<Vec<u128>> = encoded_test.collect();
-    assert_eq!(dec.unwrap(), &[150, 150, 0, 340282366920938463463374607431768211455]);
+    assert_eq!(
+        dec.unwrap(),
+        &[150, 150, 0, 340282366920938463463374607431768211455]
+    );
 }
 
 #[test]
 fn test_signed_varint128_decoder() {
-    let encoded_test : VarDecoder<i128> = hex!("
-        96 01    96 01    00 01 02 03 04")[..].into();
+    let encoded_test: VarDecoder<i128> = hex!(
+        "
+        96 01    96 01    00 01 02 03 04"
+    )[..]
+        .into();
     let dec: OrcResult<Vec<i128>> = encoded_test.collect();
     assert_eq!(dec.unwrap(), &[75, 75, 0, -1, 1, -2, 2]);
 }
 
 #[test]
 fn test_intrle1_decoder() {
-    let encoded_test : RLE1<u128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
+    let encoded_test: RLE1<u128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
     let dec: OrcResult<Vec<u128>> = encoded_test.collect();
-    assert_eq!(dec.unwrap(), &[7,7,7,7,7,7,2,3,4,7,11]);
+    assert_eq!(dec.unwrap(), &[7, 7, 7, 7, 7, 7, 2, 3, 4, 7, 11]);
 
-    let encoded_test : RLE1<i128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
+    let encoded_test: RLE1<i128> = hex!("03 00 07     FB 02 03 04 07 0B")[..].into();
     let dec: OrcResult<Vec<i128>> = encoded_test.collect();
-    assert_eq!(dec.unwrap(), &[-4,-4,-4,-4,-4,-4,1,-2,2,-4,-6]);
+    assert_eq!(dec.unwrap(), &[-4, -4, -4, -4, -4, -4, 1, -2, 2, -4, -6]);
 }
 
 #[test]
@@ -70,9 +82,9 @@ fn test_intrle2_decoder() {
 
 #[test]
 fn test_nibble() {
-    let mut nib = Nibble{
+    let mut nib = Nibble {
         buf: &hex!("01 23 45 67 89 AB CD EF")[..],
-        start: 0
+        start: 0,
     };
     assert_eq!(nib.read::<u64>(4, "").unwrap(), 0x0);
     assert_eq!(nib.read::<u64>(8, "").unwrap(), 0x12);
