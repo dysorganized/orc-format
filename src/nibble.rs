@@ -8,9 +8,11 @@ pub(crate) struct Nibble<'t> {
     pub start: usize,
 }
 impl<'t> Nibble<'t> {
-    /// Is there any more to eat?
-    pub(crate) fn is_end(&self) -> bool {
-        self.start / 8 >= self.buf.len()
+    /// Does at least one full byte remain?
+    ///
+    /// Most protocols start on byte boundaries, so it's reasonable to assume this means the end of the stream
+    pub(crate) fn is_final_byte(&self) -> bool {
+        (self.start + 7) / 8 >= self.buf.len()
     }
 
     /// Round the nibble cursor to the next byte
