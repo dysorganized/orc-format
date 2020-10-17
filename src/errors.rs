@@ -12,7 +12,7 @@ pub enum OrcError {
     EncodingError(String),
     #[error("No such stripe: {0}")]
     NoSuchStripe(usize),
-    #[error("IO Error")]
+    #[error("IO Error: {0}")]
     IOError(#[from] std::io::Error),
     #[error("End of stream")]
     EndOfStream,
@@ -24,6 +24,8 @@ pub enum OrcError {
     UTF8Error(#[from] std::str::Utf8Error),
     #[error("Cannot cast a {0} column to {1}")]
     ColumnCastException(&'static str, &'static str),
+    #[error("Invalid pr conflicting arguments supplied: {0}")]
+    InvalidArgumentException(&'static str)
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;

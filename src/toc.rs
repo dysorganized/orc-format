@@ -381,7 +381,7 @@ impl Stripe {
                         &self.footer.columns[field.id()],
                         &self.streams,
                         toc,
-                    )?,
+                    ).unwrap_or_else(|er| Column::Unsupported(er.to_string())),
                 );
             }
             Ok(DataFrame {
@@ -390,9 +390,9 @@ impl Stripe {
                 length: self.rows(),
             })
         } else {
-            panic!(
+            Err(OrcError::SchemaError(
                 "This non-standard ORC doesn't have a top level schema. Can't create a dataframe."
-            )
+            ))
         }
     }
 }

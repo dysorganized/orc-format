@@ -189,7 +189,7 @@ pub enum Column {
         fields: Vec<(String, Column)>
     },
     // Unions are not supported.
-    Unsupported(&'static str),
+    Unsupported(String),
 }
 
 impl Column {
@@ -349,10 +349,10 @@ impl Column {
                 //         _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
                 //     }
                 // }
-                Column::Unsupported("Timestamp decoding is not supported yet for Column decoding")
+                Column::Unsupported("Timestamp decoding is not supported yet for Column decoding".into())
             }
             Schema::Union { .. } => {
-                Column::Unsupported("Union columns are not well defined or supported")
+                Column::Unsupported("Union columns are not well defined or supported".into())
             }
         };
         Ok(content)
