@@ -9,7 +9,7 @@ name = "orc_format"
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["python"]
+default = []
 python = ["pyo3", "numpy"]
 
 

@@ -1,4 +1,4 @@
-use crate::errors::{OrcError, OrcResult};
+use crate::{errors::{OrcError, OrcResult}, schemata::NullableColumn};
 use crate::messages;
 use crate::schemata::{Column, DataFrame, Schema};
 use bytes::Bytes;
@@ -297,7 +297,7 @@ pub(crate) fn read_postscript(byt: &[u8]) -> OrcResult<messages::PostScript> {
 
 /// Metadata about a single stripe in an ORC file
 #[derive(Debug, PartialEq)]
-pub struct Stripe {
+pub struct  Stripe {
     pub(crate) info: messages::StripeInformation,
     pub(crate) footer: messages::StripeFooter,
     pub(crate) flat_schema: Vec<Schema>,
@@ -375,13 +375,13 @@ impl Stripe {
                 column_order.push(name.clone());
                 columns.insert(
                     name.clone(),
-                    Column::new(
+                    NullableColumn::from_stripe(
                         self,
                         &self.flat_schema[field.id()],
                         &self.footer.columns[field.id()],
                         &self.streams,
                         toc,
-                    ).unwrap_or_else(|er| Column::Unsupported(er.to_string())),
+                    )?,
                 );
             }
             Ok(DataFrame {

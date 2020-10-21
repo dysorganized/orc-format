@@ -53,12 +53,10 @@ impl PyStripe {
         let df = self.inner.dataframe(&mut (*toc).inner)?;
         let mut columns = vec![];
         for col in &df.column_order {
-            let maybe_numbers = df.columns[col].to_numbers::<f32>();
-            let numbers = match maybe_numbers {
-                Ok(v) => v.into_iter().map(|x| x.unwrap_or_default()).collect(),
-                Err(_) => vec![-1111.0]
+            match df.columns[col].valid().to_numbers::<f32>() {
+                Ok(numbers) => columns.push(numbers.into_pyarray(py).to_dyn()),
+                Err(e) => println!("Error reading column: {}", e)
             };
-            columns.push(numbers.into_pyarray(py).to_dyn());
         }
         Ok(columns)
     } 
