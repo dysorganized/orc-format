@@ -109,11 +109,11 @@ impl Schema {
 ///
 /// Note this is different from a masked column, where both empry and filled values are stored
 /// and the empty cells are merely excluded from some computations
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct NullableColumn {
     present: Option<Vec<bool>>,
     content: Column,
-    length: usize
+    length: usize,
 }
 impl NullableColumn {
     /// Read a nullable column from a stripe
@@ -141,7 +141,11 @@ impl NullableColumn {
                 })
         };
         let present = slice_by_kind(Skind::Present)
-            .and_then(|r| codecs::BooleanRLEDecoder::from(&r[..]).collect::<OrcResult<Vec<bool>>>())
+            .and_then(|r| {
+                codecs::BooleanRLEDecoder::from(&r[..])
+                    .take(stripe.rows())
+                    .collect::<OrcResult<Vec<bool>>>()
+            })
             .ok();
 
         Ok(NullableColumn::new(
@@ -159,21 +163,60 @@ impl NullableColumn {
     pub fn new(mut length: usize, present: Option<Vec<bool>>, content: Column) -> Self {
         let present = match present {
             None => None, // Completely filled vector
-            Some(v) => if v.is_empty() {
-                None // Still completely filled
-            } else if v.iter().all(|v| *v){
-                None // Still filled
-            } else {
-                length = v.len();
-                Some(v) // Looks like it has a null
+            Some(v) => {
+                if v.is_empty() {
+                    None // Still completely filled
+                } else if v.iter().all(|v| *v) {
+                    None // Still filled
+                } else {
+                    length = v.len();
+                    Some(v) // Looks like it has a null
+                }
             }
         };
-        Self { present, content, length }
+        Self {
+            present,
+            content,
+            length,
+        }
     }
-    
+
+    /// Get a slice of booleans indicating whether each element is non-null
+    /// It's optional because if the vector has no nulls (is full), the vector is absent
+    pub fn present(&self) -> Option<&[bool]> {
+        self.present.as_ref().map(|x| &x[..self.length])
+    }
+
+    /// Get a vector of vooleans that represent whether each element is non-null
+    /// If the vector is missing (meaning all values are present) then create a new
+    /// vector of all trues. This is somewhat expensive so only use this sparingly.
+    pub fn present_or_trues(&self) -> Vec<bool> {
+        match &self.present {
+            &Some(ref v) => v[..self.length].to_vec(),
+            &None => (0..self.length).map(|_| true).collect(),
+        }
+    }
+
     /// Get only the valid entries. If this column has no nulls, this is the whole column
-    pub fn valid(&self) -> &Column {
+    pub fn content(&self) -> &Column {
         &self.content
+    }
+
+    /// Fill out the content to have default values where there are nulls
+    /// This is useful for masked arrays like in Python, but it's not cheap.
+    /// This will make a copy of the original column
+    pub fn content_or_default(&self) -> Column {
+        self.content.clone().expand(self.present())
+    }
+
+    /// Get how many elements there are in this column.
+    /// It should be the same for all columns in a stripe.
+    pub fn length(&self) -> usize {
+        // This was previously necessary but may be pointless now.
+        // Boolean vectors are padded to multiples of eight on account of bit packing,
+        // so present.len() was not accurate. It may always be accurate now that the
+        // present vectors are trimmed
+        self.length
     }
 
     /// Read a column from a vector of JSON values
@@ -203,7 +246,7 @@ impl NullableColumn {
 /// Vectors with no nulls have the "present" stream omitted instead, also saving modest space.
 /// The downside is that most interesting operations require an additional copy to impute the nulls.
 /// Similarly, the overhead of `Option<X>` may outweigh the target computation.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Column {
     Boolean {
         data: Vec<bool>,
@@ -264,7 +307,7 @@ pub enum Column {
     },
     /// Structs only store if they are present. The rest is in other columns.
     Struct {
-        fields: Vec<(String, Column)>
+        fields: Vec<(String, Column)>,
     },
     // Unions are not supported.
     Unsupported(String),
@@ -399,9 +442,15 @@ impl Column {
             Schema::Struct { fields, .. } => Column::Struct {
                 // Structs have any number of fields and any number can fail
                 // Hence the collect and ?
-                fields: fields.iter().map(|(name, sch)| {
-                    Ok((name.to_string(), Column::new(stripe, sch, enc, streams, orc)?))
-                }).collect::<OrcResult<_>>()?
+                fields: fields
+                    .iter()
+                    .map(|(name, sch)| {
+                        Ok((
+                            name.to_string(),
+                            Column::new(stripe, sch, enc, streams, orc)?,
+                        ))
+                    })
+                    .collect::<OrcResult<_>>()?,
             },
             Schema::Timestamp { .. } => {
                 // It could look something like this:
@@ -413,7 +462,9 @@ impl Column {
                 //         _ => return Err(OrcError::EncodingError(format!("Timestamp doesn't support dictionary encoding")))
                 //     }
                 // }
-                Column::Unsupported("Timestamp decoding is not supported yet for Column decoding".into())
+                Column::Unsupported(
+                    "Timestamp decoding is not supported yet for Column decoding".into(),
+                )
             }
             Schema::Union { .. } => {
                 Column::Unsupported("Union columns are not well defined or supported".into())
@@ -463,15 +514,18 @@ impl Column {
             .unwrap_or(json::Value::Bool(false));
         if type_guess.is_boolean() {
             Column::Boolean {
-                data: items.into_iter().filter_map(|j| j.as_bool()).collect()
+                data: items.into_iter().filter_map(|j| j.as_bool()).collect(),
             }
         } else if type_guess.is_i64() {
             Column::Int {
-                data: items.into_iter().filter_map(|j| j.as_i64().map(|x| x as i128)).collect()
+                data: items
+                    .into_iter()
+                    .filter_map(|j| j.as_i64().map(|x| x as i128))
+                    .collect(),
             }
         } else if type_guess.is_f64() {
             Column::Double {
-                data: items.into_iter().filter_map(|j| j.as_f64()).collect()
+                data: items.into_iter().filter_map(|j| j.as_f64()).collect(),
             }
         } else {
             todo!("Unsupported JSON Column type yet: {:?}", type_guess);
@@ -481,9 +535,7 @@ impl Column {
     /// Convert to a vector of nullable booleans, if possible
     pub fn to_booleans(&self) -> Option<Vec<bool>> {
         match self {
-            Column::Boolean{ data } => {
-                Some(data.clone())
-            }
+            Column::Boolean { data } => Some(data.clone()),
             _ => None,
         }
     }
@@ -501,10 +553,7 @@ impl Column {
     /// Split a concatenated array of blobs into a vector of optional slices
     ///
     /// This is used by as_byte_slices to handle the common parts of direct and dictionary encoding
-    fn split_stream<'t, X>(
-        length: &Vec<u128>,
-        data: &'t Vec<X>,
-    ) -> Vec<&'t [X]> {
+    fn split_stream<'t, X>(length: &Vec<u128>, data: &'t Vec<X>) -> Vec<&'t [X]> {
         let mut blobs: Vec<&[X]> = vec![];
         let mut byte_cursor = 0; // Where are we in the concatenated string
         for blob_len in length {
@@ -548,6 +597,67 @@ impl Column {
     pub fn to_strings(&self) -> OrcResult<Vec<String>> {
         self.try_into()
     }
+
+    fn expand_inner<X: Default + Copy>(present: &[bool], src: &[X]) -> Vec<X> {
+        present.iter()
+        .scan((0, false), |(ix, _), &p| if p {
+            *ix += 1;
+            Some(Some(*ix-1))
+        } else {
+            Some(None)
+        })
+        .map(|ix| ix.map(|i| src[i]).unwrap_or_default())
+        .collect()
+    }
+
+    /// Expand the column, filling nulls with a default value
+    /// Column doesn't naturally have nulls so normally you should call
+    /// `NullableColumn.content_or_default()` instead.
+    /// But you can provide an array of nulls if you want.
+    pub fn expand(self, present: Option<&[bool]>) -> Column {
+        let present = match present {
+            Some(x) => x,
+            None => return self.to_owned()
+        };
+        
+        match self {
+            // Primitives use defaults,
+            // but variable length columns like strings usually don't require much change,
+            // only the length column needs to be padded.
+            Column::Boolean { data} => Column::Boolean {
+                data: Self::expand_inner(present, &data)
+            },
+            Column::Byte { data} => Column::Byte {
+                data: Self::expand_inner(present, &data)
+            },
+            Column::Int { data} => Column::Int {
+                data: Self::expand_inner(present, &data)
+            },
+            Column::Float { data} => Column::Float {
+                data: Self::expand_inner(present, &data)
+            },
+            Column::Double { data} => Column::Double {
+                data: Self::expand_inner(present, &data)
+            },
+            Column::Blob { data, length, utf8 } => Column::Blob {
+                data,
+                length: Self::expand_inner(present, &length),
+                utf8
+            },
+            Column::List { length, elements} => Column::List {
+                length: Self::expand_inner(present, &length),
+                elements
+            },
+            Column::Map { length, keys, values} => Column::Map {
+                length: Self::expand_inner(present, &length),
+                keys,
+                values
+            },
+            Column::Struct { .. } => todo!("Expanding struct columns is not implemented yet"),
+            Column::Unsupported(note) => Column::Unsupported(note),
+            _ => todo!("Can't extend this column type yet")
+        }
+    }
 }
 
 /// View the column as a vector of byte slices, if it's possible.
@@ -559,11 +669,7 @@ impl<'t> TryFrom<&'t Column> for Vec<&'t [u8]> {
     fn try_from(col: &'t Column) -> OrcResult<Self> {
         match col {
             // Blobs are stored concatenated, with a separate vector of lengths
-            Column::Blob {
-                length,
-                data,
-                ..
-            } => Ok(Column::split_stream(length, data)),
+            Column::Blob { length, data, .. } => Ok(Column::split_stream(length, data)),
             // Dictionary compressed blobs are stored as a sorted concatenated dictionary,
             // lengths of the keys of that dictionary in the same order,
             // and a vector of references into that dictionary
@@ -583,7 +689,9 @@ impl<'t> TryFrom<&'t Column> for Vec<&'t [u8]> {
                     if dict_ix < dictionary.len() {
                         blobs.push(dictionary[dict_ix]);
                     } else {
-                        return Err(OrcError::TruncatedError("Dictionary encoded column references a value outside the dictionary"))
+                        return Err(OrcError::TruncatedError(
+                            "Dictionary encoded column references a value outside the dictionary",
+                        ));
                     }
                 }
                 Ok(blobs)
@@ -640,11 +748,7 @@ impl<'t> TryFrom<&'t Column> for Vec<&'t str> {
 impl TryFrom<&Column> for Vec<String> {
     type Error = OrcError;
     fn try_from(col: &Column) -> OrcResult<Self> {
-        Ok(col
-            .as_strs()?
-            .into_iter()
-            .map(|s| s.to_owned())
-            .collect())
+        Ok(col.as_strs()?.into_iter().map(|s| s.to_owned()).collect())
     }
 }
 
@@ -683,7 +787,7 @@ impl<N: PrimNumCast> TryFrom<&Column> for Vec<N> {
         match col {
             Column::Boolean { data, .. } => data
                 .iter()
-                .map(|x| N::from(if *x {1} else {0}).ok_or_else(conversion_failed))
+                .map(|x| N::from(if *x { 1 } else { 0 }).ok_or_else(conversion_failed))
                 .collect(),
             Column::Byte { data, .. } => data
                 .iter()
@@ -705,7 +809,6 @@ impl<N: PrimNumCast> TryFrom<&Column> for Vec<N> {
         }
     }
 }
-
 
 /// An ordered set of columns; a deserialized stripe or file
 ///

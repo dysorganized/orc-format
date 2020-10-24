@@ -7,7 +7,7 @@ pub enum OrcError {
     #[error("Reached end of buffer while reading {0}")]
     TruncatedError(&'static str),
     #[error("Invalid schema: {0}")]
-    SchemaError(&'static str),
+    SchemaError(String),
     #[error("Invalid encoding: {0}")]
     EncodingError(String),
     #[error("No such stripe: {0}")]
@@ -25,7 +25,7 @@ pub enum OrcError {
     #[error("Cannot cast a {0} column to {1}")]
     ColumnCastException(&'static str, &'static str),
     #[error("Invalid pr conflicting arguments supplied: {0}")]
-    InvalidArgumentException(&'static str)
+    InvalidArgumentException(&'static str),
 }
 
 pub type OrcResult<T> = std::result::Result<T, OrcError>;

@@ -9,7 +9,7 @@ name = "orc_format"
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = []
+default = ["python"]
 python = ["pyo3", "numpy"]
 
 
@@ -35,3 +35,6 @@ optional = true
 [dependencies.numpy]
 version = "0.12.1"
 optional = true 
+
+[package.metadata.maturin]
+requires-dist = ["numpy >= 0.13.0", "pandas >= 1.0.0"]
