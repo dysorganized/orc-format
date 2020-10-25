@@ -113,12 +113,14 @@ def test_read_tiny_file():
     data, lengths = column.as_numpy("packed")
     assert data.dtype == np.dtype(np.uint8)
     assert lengths.dtype == np.dtype(np.int64)
+    assert data.tobytes() == bytes(b"8  20 ")
     assert np.all(lengths.mask == [True, False, False])
     assert np.all(lengths == [0, 3, 3])
 
     # Padded bytes: a compromise between speed and efficiency
     packed_bytes = column.as_numpy("padded bytes")
     assert packed_bytes.dtype == "|S3"
+    assert packed_bytes.tobytes() == bytes(b"N/A8  20 ")
     assert np.all(packed_bytes.mask == [True, False, False])
     assert np.all(packed_bytes == [b"", b"8  ", b"20 "])
 
@@ -132,6 +134,52 @@ def test_read_tiny_file():
         (column.as_pandas() == pd.Series([None, "8  ", "20 "]))
         == pd.Series([False, True, True]) # Because nan != nan
     ).all()
+
+    # Eleventh column: Varchar(2)
+    # Twelfth column: String
+    # Thirteenth column: Blob
+    # There are three ways to send these, depending on your needs.
+    for dtype, column in [
+        (str, stripe.column(11, toc)),   # Varchar(2)
+        (str, stripe.column(12, toc)),   # String, which is the same
+        (bytes, stripe.column(13, toc)), # Blob, which is barely different
+    ]:
+
+        # Packed representation: the most efficient and least convenient.
+        # It returns a data array and a masked length array
+        data, lengths = column.as_numpy("packed")
+        assert data.dtype == np.dtype(np.uint8)
+        assert lengths.dtype == np.dtype(np.int64)
+        assert data.tobytes() == bytes(b"820")
+        assert np.all(lengths.mask == [True, False, False])
+        assert np.all(lengths == [0, 1, 2])
+
+        # Padded bytes: a compromise between speed and efficiency
+        packed_bytes = column.as_numpy("padded bytes")
+        # It seems it will truncate the fill value if necessary (here N/A is N/)
+        assert packed_bytes.tobytes() == bytes(b"N/8\x0020")
+        assert packed_bytes.dtype == "|S2"
+        assert np.all(packed_bytes.mask == [True, False, False])
+        assert np.all(packed_bytes == [b"", b"8\x00", b"20"])
+
+        # Objects: Not fast but easy to use
+        objects = column.as_numpy("objects")
+        assert np.all(objects.mask == [True, False, False])
+        if dtype is str:
+            assert np.all(objects == ["", "8", "20"])
+            # Pandas series in this case are always objects
+            assert (
+                (column.as_pandas() == pd.Series([None, "8", "20"]))
+                == pd.Series([False, True, True]) # Because nan != nan
+            ).all()
+        elif dtype is bytes:
+            assert np.all(objects == [b"", b"8", b"20"])
+            # Pandas series in this case are always objects
+            assert (
+                (column.as_pandas() == pd.Series([None, b"8", b"20"]))
+                == pd.Series([False, True, True]) # Because nan != nan
+            ).all()
+        
 
     # assert np.all(df == [
     #     ma([False, True, True], [True, False, False]),

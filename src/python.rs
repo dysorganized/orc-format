@@ -288,7 +288,7 @@ impl PyNullableColumn {
                             if utf8 {
                                 v.push(std::str::from_utf8(&data[start..start + len])?.to_object(py));
                             } else {
-                                v.push((&data[start..start + len]).to_object(py));
+                                v.push(PyBytes::new(py, &data[start..start + len]).to_object(py));
                             }
                             start += len;
                         }
