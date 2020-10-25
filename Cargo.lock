@@ -367,6 +367,7 @@ dependencies = [
  "flate2",
  "hex-literal",
  "maplit",
+ "ndarray",
  "num-traits",
  "numpy",
  "prost",

@@ -2,7 +2,7 @@ use crate::errors::*;
 use crate::schemata::{Column, NullableColumn};
 use crate::ORCFile;
 use numpy::{IntoPyArray, PyArray1};
-use pyo3::{create_exception, types::{IntoPyDict, PyDict}};
+use pyo3::{create_exception, types::{IntoPyDict, PyBytes, PyDict, PyTuple}};
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 use pyo3::{exceptions, PyErr, PyResult};
@@ -199,12 +199,26 @@ impl PyNullableColumn {
     /// Convert a column to a masked numpy array
     ///
     /// This has several advantages and disadvantages against pandas in this context.
-    /// * Only floating point arrays are nullable in Pandas, but numpy masked arrays
-    ///   support all data types
-    /// * We can use a second array to represent lengths for variable length cells
-    ///   like strings. This is vastly faster than a numpy of numpy objects (strings).
-    ///   It's not very convenient but useful in a pinch.  
-    pub fn as_numpy<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    /// * Numpy masked arrays support all data types
+    /// * Three different methods are available for retrieving variable length columns
+    ///
+    /// Accepts
+    /// -------
+    /// * blob: one of "packed", "padded bytes", "objects", or None
+    ///   * blob = "packed":  
+    ///     Return blob and string columns as two separate vectors,
+    ///     (data, masked_length), where all the content is stored contiguously
+    ///     Null blobs are masked, and empty blobs have 0 length.
+    ///     This is the native format of ORC so this method is much faster.
+    ///   * blob = "padded bytes":  
+    ///     All the blobs are padded to the length of the longest blob
+    ///     and then stored as a contiguous vector with numpy dtype "|Sn"
+    ///     where n is the longest blob.
+    ///     Since it creates only one vector, unless your blobs/strings are >50 bytes
+    ///     this is probably a good compromise between speed and ease of use
+    ///   * blob = "objects":  
+    ///     Return the 
+    pub fn as_numpy<'py>(&self, py: Python<'py>, blob: Option<&str>) -> PyResult<PyObject> {
         // This function is somewhat involved because we need help from Numpy
         // to generate the masked arrays we want.
         let col = &self.inner;
@@ -212,6 +226,7 @@ impl PyNullableColumn {
         // The arrays need to be dynamically typed so we cast them to PyObject
         // Then we convert them to masked arrays (inside python)
         let np = py.import("numpy")?;
+        let mut suggested_dtype = None;
 
         let present = col.present_or_trues();
         let content : PyObject = match col.content_or_default() {
@@ -225,31 +240,66 @@ impl PyNullableColumn {
                 .into(),
             Column::Float { data, .. } => data.clone().into_pyarray(py).into(),
             Column::Double { data, .. } => data.clone().into_pyarray(py).into(),
-            // Column::Blob { data, length, utf8} => {
-            //     if utf8 {
-            //         let v: Vec<String> = vec![];
-            //         let mut start = 0;
-            //         for len in length {
-            //             let len = len as usize;
-            //             v.push(&data[start..start + len].to_owned());
-            //             start += len;
-            //         }
-            //         v.into_pyarray(py).into()
-            //     } else {
-            //         let v: Vec<&[u8]> = vec![];
-            //         let mut start = 0;
-            //         for len in length {
-            //             let len = len as usize;
-            //             v.push(&data[start..start + len]);
-            //             start += len;
-            //         }
-            //         v.into_pyarray(py).into()
-            //     }
-            // }
-            //Column::Blob { data, .. } => data.clone().into_pyarray(py).into(),
+            Column::Blob { data, length, utf8} => {
+                // Packed vectors are easy
+                match blob {
+                    Some("packed") => (
+                        // Keep the string packed as bytes
+                        data.clone().into_pyarray(py).to_object(py),
+                        length
+                            .iter()
+                            .map(|x| *x as i64)
+                            .collect::<Vec<_>>()
+                            .into_pyarray(py)
+                            .to_object(py)
+                        ).to_object(py),
+                    Some("padded bytes") => {
+                        // Pad the vector to get 
+                        let mut start = 0;
+                        let max_len = length.iter().copied().max().unwrap_or_default() as usize;
+                        let mut v: Vec<u8> = vec![0u8; length.len() * max_len];
+                        for (row_num, len) in length.iter().enumerate() {
+                            let len = *len as usize;
+                            v[row_num * max_len .. row_num * max_len + len]
+                                .copy_from_slice(&data[start..start + len]);
+                            start += len;
+                        }
+                        // We need Numpy to read this buffer as a vector of packed strings
+                        // But if course by default it thinks it's a uint8 array
+                        // So we drop into Python to solve that
+                        let v = PyBytes::new(py, &v);
+                        let locals = [
+                            ("np", np.to_object(py)),
+                            ("v", v.to_object(py)),
+                            ("dtype", format!("|S{}", max_len).to_object(py))
+                        ].into_py_dict(py);
+                        py.eval(
+                            "np.frombuffer(v, dtype=dtype)", 
+                            None,
+                            Some(&locals)
+                        )?.into()
+                    },
+                    Some("objects") | None => {
+                        // Unpack the vector into String objects
+                        let mut v: Vec<PyObject> = vec![];
+                        let mut start = 0;
+                        for len in length {
+                            let len = len as usize;
+                            if utf8 {
+                                v.push(std::str::from_utf8(&data[start..start + len])?.to_object(py));
+                            } else {
+                                v.push((&data[start..start + len]).to_object(py));
+                            }
+                            start += len;
+                        }
+                        suggested_dtype = Some("object");
+                        v.to_object(py)
+                    },
+                    _ => return Err(OrcError::InvalidArgumentException("blob must be one of 'packed', 'padded bytes', 'objects', or None").into())
+                }
+            }
             _ => {
                 return Err(OrcError::SchemaError(format!("Serializing {:?} isn't supported yet", self.inner)).into());
-                present.clone().into_pyarray(py).into()
             },
         };
         // Once we're done using it hand off the mask to python
@@ -258,9 +308,11 @@ impl PyNullableColumn {
         let locals = [
             ("np", np.into()),
             ("a", content),
-            ("m", present)].into_py_dict(py);
+            ("m", present),
+            ("dtype", suggested_dtype.to_object(py))
+        ].into_py_dict(py);
         let masked_array = py.eval(
-            "np.ma.masked_array(a, ~m)", 
+            "(a[0], np.ma.masked_array(a[1], ~m)) if type(a) is tuple else np.ma.masked_array(a, ~m, dtype=dtype)", 
             None,
             Some(&locals)
         )?;
@@ -272,7 +324,7 @@ impl PyNullableColumn {
         // Only import pandas if they request it
         let pd = py.import("pandas")?;
         let locals = [
-            ("np_form", self.as_numpy(py)?),
+            ("np_form", self.as_numpy(py, None)?),
             ("pd", pd.into())
         ].into_py_dict(py);
         Ok(py.eval(

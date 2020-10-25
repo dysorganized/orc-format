@@ -95,12 +95,41 @@ def test_read_tiny_file():
     #     == pd.Series([False, True, True]) # Because nan != nan
     # ).all()
 
-    # Ninth column: what?
+    # Ninth column: Char
     column = stripe.column(9, toc)
-    assert column.as_numpy().dtype == np.float64
-    assert (column.as_numpy() == ma([False, 8, 20], [True, False, False])).all()
+    assert column.as_numpy().dtype == np.dtype("O")
+    assert (column.as_numpy() == ma([False, "8", "2"], [True, False, False])).all()
     assert (
-        (column.as_pandas() == pd.Series([np.nan, 8., 20.]))
+        (column.as_pandas() == pd.Series([np.nan, "8", "2"]))
+        == pd.Series([False, True, True]) # Because nan != nan
+    ).all()
+
+    # Tenth column: Char(3)
+    # There are three ways to send these, depending on your needs.
+    column = stripe.column(10, toc)
+
+    # Packed representation: the most efficient and least convenient.
+    # It returns a data array and a masked length array
+    data, lengths = column.as_numpy("packed")
+    assert data.dtype == np.dtype(np.uint8)
+    assert lengths.dtype == np.dtype(np.int64)
+    assert np.all(lengths.mask == [True, False, False])
+    assert np.all(lengths == [0, 3, 3])
+
+    # Padded bytes: a compromise between speed and efficiency
+    packed_bytes = column.as_numpy("padded bytes")
+    assert packed_bytes.dtype == "|S3"
+    assert np.all(packed_bytes.mask == [True, False, False])
+    assert np.all(packed_bytes == [b"", b"8  ", b"20 "])
+
+    # Objects: Not fast but easy to use
+    objects = column.as_numpy("objects")
+    assert np.all(objects.mask == [True, False, False])
+    assert np.all(objects == ["", "8  ", "20 "])
+
+    # Pandas series in this case are always objects
+    assert (
+        (column.as_pandas() == pd.Series([None, "8  ", "20 "]))
         == pd.Series([False, True, True]) # Because nan != nan
     ).all()
 
