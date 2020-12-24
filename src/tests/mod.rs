@@ -135,20 +135,20 @@ fn test_read_footer() {
                 "_col22".into(),
                 Sch::Map {
                     id: 39,
-                    key: Box::new(Sch::Int { id: 41 }),
-                    value: Box::new(Sch::String { id: 40 })
+                    key: Box::new(Sch::String { id: 40 }),
+                    value: Box::new(Sch::Int { id: 41 })
                 }
             ),
             (
                 "_col23".into(),
                 Sch::Map {
                     id: 42,
-                    key: Box::new(Sch::Map {
+                    key: Box::new(Sch::String { id: 43 }),
+                    value: Box::new(Sch::Map {
                         id: 44,
-                        key: Box::new(Sch::Int { id: 46 }),
-                        value: Box::new(Sch::String { id: 45 })
-                    }),
-                    value: Box::new(Sch::String { id: 43 })
+                        key: Box::new(Sch::String { id: 45 }),
+                        value: Box::new(Sch::Int { id: 46 })
+                    })
                 }
             )
         ]
@@ -298,6 +298,7 @@ fn go_read_test1() {
         frame.columns["string1"].to_strings().unwrap(),
         vec![Some("hi".to_string()), Some("bye".to_string())]
     );
+    println!("{:#?}", frame);
     // TODO: column "middle" (a struct)
     // TODO: column "list"
     // TODO: column "map"

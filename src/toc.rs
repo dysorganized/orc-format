@@ -178,8 +178,9 @@ impl<F: Read + Seek> ORCFile<F> {
                     inner: pop(&mut roots)?,
                 },
                 Kind::Map => {
-                    // Undo reverse subtype order
-                    let (value, key) = (pop(&mut roots)?, pop(&mut roots)?);
+                    // Keys are the first child, and values are second
+                    let key = pop(&mut roots)?;
+                    let value = pop(&mut roots)?;
                     Schema::Map { id, key, value }
                 }
                 Kind::Struct => {

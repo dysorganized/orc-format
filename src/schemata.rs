@@ -186,6 +186,7 @@ pub enum Column {
     /// Structs only store if they are present. The rest is in other columns.
     Struct {
         present: Option<Vec<bool>>,
+        fields: Vec<(String, Column)>
     },
     // Unions are not supported.
     Unsupported(&'static str),
@@ -319,13 +320,25 @@ impl Column {
                     },
                 }
             }
-            Schema::Map { .. } => Column::Unsupported("Map columns are not supported yet."),
+            Schema::Map { key, value, .. } => Column::Map {
+                present,
+                length: uint_enc(len?)?,
+                keys: Box::new(Column::new(stripe, key, enc, streams, orc)?),
+                values: Box::new(Column::new(stripe, value, enc, streams, orc)?),
+            },
             Schema::List { inner, .. } => Column::List {
                 present,
                 length: uint_enc(len?)?,
                 elements: Box::new(Column::new(stripe, inner, enc, streams, orc)?),
             },
-            Schema::Struct { .. } => Column::Struct { present },
+            Schema::Struct { fields, .. } => Column::Struct {
+                // Structs have any number of fields and any number can fail
+                // Hence the collect and ?
+                present,
+                fields: fields.iter().map(|(name, sch)| {
+                    Ok((name.to_string(), Column::new(stripe, sch, enc, streams, orc)?))
+                }).collect::<OrcResult<_>>()?
+            },
             Schema::Timestamp { .. } => {
                 // It could look something like this:
                 // ColumnContent::Timestamp{
@@ -381,7 +394,7 @@ impl Column {
             | Self::List { present, .. }
             | Self::Decimal { present, .. }
             | Self::Timestamp { present, .. }
-            | Self::Struct { present } => present,
+            | Self::Struct { present, .. } => present,
             Self::Unsupported(note) => unimplemented!("{}", note),
         }
     }
@@ -756,6 +769,7 @@ impl<N: PrimNumCast> TryFrom<&Column> for Vec<N> {
         }
     }
 }
+
 
 // TODO: Write this more compactly
 macro_rules! basic_column_from_vec {
