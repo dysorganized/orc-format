@@ -230,7 +230,8 @@ fn read_column() {
 #[test]
 fn go_read_empty_file() {
     let orc_bytes = include_bytes!("examples/TestOrcFile.emptyFile.orc");
-    ORCFile::from_slice(&orc_bytes[..]).expect_err("ORC should have been empty");
+    let toc = ORCFile::from_slice(&orc_bytes[..]).unwrap();
+    assert_eq!(toc.stripe_count(), 0);
 }
 
 #[test]
@@ -238,7 +239,12 @@ fn go_read_metadata() {
     let orc_bytes = include_bytes!("examples/TestOrcFile.metaData.orc");
     let ref mut toc = ORCFile::from_slice(&orc_bytes[..]).unwrap();
     let column = toc.stripe(0).unwrap().dataframe(toc).unwrap();
-    assert_eq!(toc.user_metadata(), hashmap! {"foo".into() => "bar".into()});
+    let reference_metadata = hashmap! {
+        "clobber".into() => vec![5, 7, 11, 13, 17, 19],
+        "my.meta".into() => vec![1, 2, 3, 4, 5, 6, 7, 255, 254, 127, 128],
+        "big".into() => include_bytes!("examples/expected/metadata.raw").to_vec()
+    };
+    assert_eq!(toc.user_metadata(), reference_metadata);
 }
 
 /// The simplest test - a tiny table. This one without using JSON.
