@@ -4,14 +4,19 @@ extern crate maplit;
 extern crate hex_literal;
 #[macro_use]
 extern crate serde_json;
+
 mod codecs;
 mod errors;
 mod nibble;
+#[cfg(feature = "python")]
+pub mod python;
 mod schemata;
 #[cfg(test)]
 mod tests;
 mod toc;
 
+#[cfg(feature = "python")]
+pub use python::orc_format;
 pub use schemata::Column;
 pub use toc::ORCFile;
 

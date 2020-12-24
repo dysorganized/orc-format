@@ -255,48 +255,60 @@ fn go_read_test1() {
     let frame = toc.stripe(0).unwrap().dataframe(toc).unwrap();
 
     assert_eq!(
-        frame.columns["boolean1"].to_booleans(),
-        Some(vec![Some(false), Some(true)])
+        frame.columns["boolean1"].content().to_booleans(),
+        Some(vec![false, true])
     );
     assert_eq!(
-        frame.columns["byte1"].to_all_numbers::<u8>().unwrap(),
+        frame.columns["byte1"].content().to_numbers::<u8>().unwrap(),
         vec![1u8, 100]
     );
     assert_eq!(
-        frame.columns["short1"].to_all_numbers::<i16>().unwrap(),
+        frame.columns["short1"]
+            .content()
+            .to_numbers::<i16>()
+            .unwrap(),
         vec![1024i16, 2048]
     );
     assert_eq!(
-        frame.columns["int1"].to_all_numbers::<i32>().unwrap(),
+        frame.columns["int1"].content().to_numbers::<i32>().unwrap(),
         vec![65536i32, 65536]
     );
     assert_eq!(
-        frame.columns["long1"].to_all_numbers::<i64>().unwrap(),
+        frame.columns["long1"]
+            .content()
+            .to_numbers::<i64>()
+            .unwrap(),
         vec![9223372036854775807i64, 9223372036854775807]
     );
     assert_eq!(
-        frame.columns["float1"].to_all_numbers::<f32>().unwrap(),
+        frame.columns["float1"]
+            .content()
+            .to_numbers::<f32>()
+            .unwrap(),
         vec![1f32, 2.]
     );
     assert_eq!(
-        frame.columns["double1"].to_all_numbers::<f64>().unwrap(),
+        frame.columns["double1"]
+            .content()
+            .to_numbers::<f64>()
+            .unwrap(),
         vec![-15f64, -5.]
     );
     assert_eq!(
-        frame.columns["bytes1"].as_slices().unwrap(),
-        vec![Some(&[0, 1, 2, 3, 4][..]), Some(&[])]
+        frame.columns["bytes1"].content().as_slices().unwrap(),
+        vec![&[0, 1, 2, 3, 4][..], &[]]
     );
     assert_eq!(
-        frame.columns["bytes1"].to_vecs().unwrap(),
-        vec![Some(vec![0, 1, 2, 3, 4]), Some(vec![])]
+        frame.columns["bytes1"].content().to_vecs().unwrap(),
+        vec![vec![0, 1, 2, 3, 4], vec![]]
     );
     assert_eq!(
-        frame.columns["string1"].as_strs().unwrap(),
-        vec![Some("hi"), Some("bye")]
+        frame.columns["string1"].content().as_strs().unwrap(),
+        vec!["hi", "bye"]
     );
     assert_eq!(
-        frame.columns["string1"].to_strings().unwrap(),
-        vec![Some("hi".to_string()), Some("bye".to_string())]
+        frame.columns["string1"].content().to_strings().unwrap(),
+        vec!["hi".to_string(), "bye".to_string()]
     );
     println!("{:#?}", frame);
     // TODO: column "middle" (a struct)

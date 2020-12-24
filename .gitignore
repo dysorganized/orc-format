@@ -1,5 +1,7 @@
 /target
 /.vscode
+/venv
+*.pyc
 
 #Added by cargo
 #

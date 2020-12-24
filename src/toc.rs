@@ -1,6 +1,9 @@
-use crate::errors::{OrcError, OrcResult};
 use crate::messages;
 use crate::schemata::{Column, DataFrame, Schema};
+use crate::{
+    errors::{OrcError, OrcResult},
+    schemata::NullableColumn,
+};
 use bytes::Bytes;
 use prost::Message;
 use std::collections::HashMap;
@@ -152,7 +155,7 @@ impl<F: Read + Seek> ORCFile<F> {
         // All the places we need it will also need to be Boxed to avoid making ColumnSpec infinitely recursive.
         let pop = |t: &mut Vec<Schema>| {
             t.pop()
-                .ok_or(OrcError::SchemaError("Missing child type"))
+                .ok_or(OrcError::SchemaError("Missing child type".into()))
                 .map(|x| Box::new(x))
         };
 
@@ -186,7 +189,7 @@ impl<F: Read + Seek> ORCFile<F> {
                 Kind::Struct => {
                     if raw_type.field_names.len() != raw_type.subtypes.len() {
                         return Err(OrcError::SchemaError(
-                            "Field names don't match field types in struct",
+                            "Field names don't match field types in struct".into(),
                         ));
                     }
                     // Keep in mind these subtypes will be in reverse order, note rev() before zip()
@@ -201,7 +204,7 @@ impl<F: Read + Seek> ORCFile<F> {
                     Schema::Struct { id, fields }
                 }
                 Kind::Union => {
-                    return Err(OrcError::SchemaError("Union types are not yet supported"))
+                    return Err(OrcError::SchemaError("Union types are not yet supported".into()))
                 }
                 Kind::Decimal => Schema::Decimal {
                     id,
@@ -226,8 +229,8 @@ impl<F: Read + Seek> ORCFile<F> {
         // I don't see this in the standard but Hive seems to keep everything under one root Struct
         match roots.pop() {
             Some(Schema::Struct { fields, .. }) => Ok((fields, all)),
-            None => Err(OrcError::SchemaError("Top level schema is empty")),
-            _ => Err(OrcError::SchemaError("Top level schema was not a struct")),
+            None => Err(OrcError::SchemaError("Top level schema is empty".into())),
+            _ => Err(OrcError::SchemaError("Top level schema was not a struct".into())),
         }
     }
 
@@ -355,13 +358,13 @@ impl Stripe {
     }
 
     /// Read and return one column from the stripe
-    pub fn column<F: Read + Seek>(&self, id: usize, toc: &mut ORCFile<F>) -> OrcResult<Column> {
+    pub fn column<F: Read + Seek>(&self, id: usize, toc: &mut ORCFile<F>) -> OrcResult<NullableColumn> {
         if self.footer.columns.len() != self.flat_schema.len() {
             return Err(OrcError::SchemaError(
-                "Stripe column definitions don't match schema",
+                "Stripe column definitions don't match schema".into(),
             ));
         }
-        Column::new(
+        NullableColumn::from_stripe(
             self,
             &self.flat_schema[id],
             &self.footer.columns[id],
@@ -379,7 +382,7 @@ impl Stripe {
                 column_order.push(name.clone());
                 columns.insert(
                     name.clone(),
-                    Column::new(
+                    NullableColumn::from_stripe(
                         self,
                         &self.flat_schema[field.id()],
                         &self.footer.columns[field.id()],
@@ -394,9 +397,9 @@ impl Stripe {
                 length: self.rows(),
             })
         } else {
-            panic!(
-                "This non-standard ORC doesn't have a top level schema. Can't create a dataframe."
-            )
+            Err(OrcError::SchemaError(
+                "This non-standard ORC doesn't have a top level schema. Can't create a dataframe.".into(),
+            ))
         }
     }
 }
