@@ -225,11 +225,10 @@ impl NullableColumn {
     ///
     /// ```
     /// use serde_json::json;
-    /// use orc_format::Column;
-    /// let orig = &[json!(1), json!(null), json!(3)];
+    /// use orc_format::NullableColumn;
     /// assert_eq!(
-    ///     NullableColumn::from_json(orig),
-    ///     NullableColumn::from(vec![1i128, 2, 3])
+    ///     NullableColumn::from_json(&[json!(1), json!(null), json!(3)]),
+    ///     NullableColumn::new(3, Some(vec![true, false, true]), vec![1i128, 3].into())
     /// );
     /// ```
     pub fn from_json(items: &[json::Value]) -> Self {
@@ -658,6 +657,28 @@ impl Column {
             _ => todo!("Can't extend this column type yet")
         }
     }
+    
+    /// Get the length of the column, or 0 if it doesn't apply (e.g. unsupported)
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Boolean { data, .. } => data.len(),
+            Self::Byte { data, .. } => data.len(),
+            Self::Int { data, .. } => data.len(),
+            Self::Float { data, .. } => data.len(),
+            Self::Double { data, .. } => data.len(),
+            Self::Blob { data, .. } => data.len(),
+            Self::BlobDict { data, .. } => data.len(),
+            Self::Decimal { data, ..} => data.len(),
+            Self::Map { length, .. }
+            | Self::List { length, .. } => length.len(),
+            Self::Timestamp { seconds, .. } => seconds.len(),
+            Self::Struct { fields, .. } => fields.first()
+                .map(|f| f.1.len())
+                .unwrap_or_default(),
+            Self::Unsupported(..) => 0,
+        }
+    }
+    
 }
 
 /// View the column as a vector of byte slices, if it's possible.
@@ -806,6 +827,57 @@ impl<N: PrimNumCast> TryFrom<&Column> for Vec<N> {
                 .map(|x| N::from(*x).ok_or_else(conversion_failed))
                 .collect(),
             _ => Err(conversion_failed()),
+        }
+    }
+}
+
+impl From<Vec<i128>> for Column {
+    fn from(elems: Vec<i128>) -> Self {
+        Column::Int{ data: elems }
+    }
+}
+impl From<Vec<i64>> for Column {
+    fn from(elems: Vec<i64>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<i32>> for Column {
+    fn from(elems: Vec<i32>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<i16>> for Column {
+    fn from(elems: Vec<i16>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<i8>> for Column {
+    fn from(elems: Vec<i8>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<u64>> for Column {
+    fn from(elems: Vec<u64>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<u32>> for Column {
+    fn from(elems: Vec<u32>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl From<Vec<u16>> for Column {
+    fn from(elems: Vec<u16>) -> Self {
+        Column::Int{ data: elems.iter().map(|&x| x.into()).collect() }
+    }
+}
+impl<X: Into<Column>> From<X> for NullableColumn {
+    fn from(elems: X) -> Self {
+        let col = elems.into();
+        NullableColumn {
+            length: col.len(),
+            content: col,
+            present: None
         }
     }
 }

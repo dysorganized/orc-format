@@ -45,7 +45,7 @@ impl<F: Read + Seek> ORCFile<F> {
         while comp_buffer.len() >= 4 {
             let (chunk_len, is_compressed) = match self.postscript.compression() {
                 // Messages without compression have no header
-                messages::CompressionKind::None => (0, false),
+                messages::CompressionKind::None => (comp_buffer.len(), false),
                 _ => {
                     let enc = [comp_buffer[0], comp_buffer[1], comp_buffer[2], 0];
                     let enc_len = u32::from_le_bytes(enc);
@@ -55,17 +55,21 @@ impl<F: Read + Seek> ORCFile<F> {
             match (is_compressed, self.postscript.compression()) {
                 (false, messages::CompressionKind::None) => {
                     // Messages without compression have no header
+                    println!("uncompressed file");
                     decomp_buffer.extend_from_slice(&comp_buffer);
                 }
                 (false, _) => {
                     // Messages with compression, but where this block is uncompressed still have a header
+                    println!("uncompressed block");
                     decomp_buffer.extend_from_slice(&comp_buffer[3..chunk_len+3]);
                 }
                 (true, messages::CompressionKind::Zlib) => {
+                    println!("zlib block");
                     let mut decoder = flate2::read::DeflateDecoder::new(&comp_buffer[3..chunk_len+3]);
                     decoder.read_to_end(&mut decomp_buffer)?;
                 }
                 (true, messages::CompressionKind::Snappy) => {
+                    println!("snappy block");
                     let mut decoder = snap::read::FrameDecoder::new(&comp_buffer[3..chunk_len+3]);
                     decoder.read_to_end(&mut decomp_buffer)?;
                 }
@@ -74,7 +78,7 @@ impl<F: Read + Seek> ORCFile<F> {
                 // Lz4 = 4,
                 // Zstd = 5,
             };
-            comp_buffer = &comp_buffer[chunk_len + 3..];
+            comp_buffer = &comp_buffer[(chunk_len + 3).min(comp_buffer.len())..];
         }
         Ok(Bytes::from(decomp_buffer))
     }
